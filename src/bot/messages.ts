@@ -17,6 +17,8 @@ export const BOT_MESSAGES = {
     '• /list_destinations [source_id] - List destinations (optionally filtered by source ID)\n' +
     '• /remove_destination <destination_id> - Deactivate a destination group (retains delivery history)\n' +
     '• /activate_destination <destination_id> - Reactivate a previously deactivated destination group\n\n' +
+    '📤 Testing & Forwarding Commands (Admins only):\n' +
+    '• /test_forward <destination_chat_id> [msg_id] - Test forwarding a message to a destination (reply to message or specify ID)\n\n' +
     'General Commands:\n' +
     '• /start - Welcome message and introduction\n' +
     '• /help - Display this command manual\n\n' +

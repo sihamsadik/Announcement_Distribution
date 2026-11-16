@@ -187,6 +187,7 @@ The system can monitor specific Telegram forum topics within course supergroups 
 | `/list_destinations [source_id]` | Displays destinations (optionally filtered by source ID) | Admins Only |
 | `/remove_destination <destination_id>` | Deactivates a destination group (`isActive: false`, preserves history) | Admins Only |
 | `/activate_destination <destination_id>` | Reactivates a previously deactivated destination group | Admins Only |
+| `/test_forward <destination_chat_id> [msg_id]` | Tests forwarding a single message to a destination (reply to message or pass ID) | Admins Only |
 
 #### Usage Examples:
 
@@ -213,6 +214,23 @@ The system can monitor specific Telegram forum topics within course supergroups 
   /remove_destination <destination_id>
   /activate_destination <destination_id>
   ```
+
+- **Test Forwarding a Message**:
+  Reply to any announcement message in the source group:
+  ```text
+  /test_forward -1009876543210
+  ```
+  *(or pass the source message ID explicitly: `/test_forward -1009876543210 42`)*
+
+---
+
+## Message Forwarding Engine
+
+The message forwarding engine ([src/services/forwarding.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/forwarding.service.ts)) enables native Telegram message forwarding:
+
+1. **Native Forwarding**: Uses Telegram's `telegram.forwardMessage(...)` API. This preserves original sender/author attribution, supports all media formats (photos, documents, videos, text, voice, audio), and avoids costly media download/re-upload cycles.
+2. **Error Taxonomy**: Telegram API errors are categorized into structured error types (`BOT_NOT_MEMBER`, `PERMISSION_DENIED`, `MESSAGE_NOT_FOUND`, `PROTECTED_CONTENT`, `RATE_LIMITED`, `INVALID_CHAT_ID`, `UNKNOWN_ERROR`) with clear explanations.
+3. **Controlled Testing**: The `/test_forward` command allows administrators to test single-message forwarding safely without triggering distribution to all groups. Bot tokens are completely sanitized from logs and error messages.
 
 ---
 

@@ -4,6 +4,7 @@ import { isAuthorizedAdmin } from './auth';
 import { sourceService } from '../services/source.service';
 import { detectSourceAnnouncement } from './detector';
 import { registerDestinationCommands } from './destination.commands';
+import { registerForwardingCommands } from './forwarding.commands';
 
 /**
  * Strips any occurrence of the bot token from error strings or logs.
@@ -167,6 +168,9 @@ export function setupBotHandlers(bot: Telegraf, token?: string): void {
 
   // Register destination management commands (/register_destination, /list_destinations, etc.)
   registerDestinationCommands(bot, token);
+
+  // Register message forwarding test command (/test_forward)
+  registerForwardingCommands(bot, token);
 
   // Listener for general messages: detects announcements from registered source topics
   bot.on('message', async (ctx, next) => {
