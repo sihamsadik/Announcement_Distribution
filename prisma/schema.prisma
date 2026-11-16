@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ForwardingStatus {
+  SUCCESS
+  FAILED
+}
+
+model SourceGroup {
+  id        String   @id @default(uuid())
+  chatId    BigInt
+  topicId   BigInt
+  name      String
+  createdAt DateTime @default(now())
+
+  destinationGroups DestinationGroup[]
+
+  @@unique([chatId, topicId])
+  @@index([chatId])
+}
+
+model DestinationGroup {
+  id            String      @id @default(uuid())
+  sourceGroupId String
+  chatId        BigInt
+  groupName     String
+  isActive      Boolean     @default(true)
+  createdAt     DateTime    @default(now())
+
+  sourceGroup    SourceGroup     @relation(fields: [sourceGroupId], references: [id], onDelete: Cascade)
+  forwardingLogs ForwardingLog[]
+
+  @@unique([sourceGroupId, chatId])
+  @@index([chatId])
+  @@index([sourceGroupId, isActive])
+}
+
+model ForwardingLog {
+  id                 String           @id @default(uuid())
+  sourceChatId       BigInt
+  sourceMessageId    Int
+  destinationGroupId String
+  status             ForwardingStatus
+  errorMessage       String?
+  createdAt          DateTime         @default(now())
+
+  destinationGroup DestinationGroup @relation(fields: [destinationGroupId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceChatId, sourceMessageId, destinationGroupId])
+  @@index([destinationGroupId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([sourceChatId, sourceMessageId])
+}

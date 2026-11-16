@@ -12,6 +12,7 @@ A Telegram bot service built with **Node.js**, **TypeScript**, **Telegraf**, and
 - [Environment Configuration](#environment-configuration)
 - [Telegram Bot Group Permissions & Privacy Mode](#telegram-bot-group-permissions--privacy-mode)
 - [Installation and Building](#installation-and-building)
+- [Database Schema & Prisma 7](#database-schema--prisma-7)
 - [Running the Application](#running-the-application)
 - [Verification and Testing](#verification-and-testing)
 - [Security Considerations](#security-considerations)
@@ -110,6 +111,53 @@ Run test suite:
 ```bash
 npm test
 ```
+
+---
+
+## Database Schema & Prisma 7
+
+The application uses **PostgreSQL** and **Prisma 7** for data persistence.
+
+### Models
+
+1. **`SourceGroup`**: Represents an announcement origin (a Telegram group chat and specific topic/thread ID).
+   - `id`: UUID Primary Key
+   - `chatId`: BigInt (Telegram Chat ID)
+   - `topicId`: BigInt (Telegram Topic Thread ID)
+   - `name`: Human-readable identifier
+   - Unique: `(chatId, topicId)`
+
+2. **`DestinationGroup`**: Represents student groups mapped to receive announcements.
+   - `id`: UUID Primary Key
+   - `sourceGroupId`: Foreign Key referencing `SourceGroup.id` (`onDelete: Cascade`)
+   - `chatId`: BigInt (Telegram Destination Chat ID)
+   - `groupName`: Human-readable name
+   - `isActive`: Boolean flag (default `true`)
+   - Unique: `(sourceGroupId, chatId)`
+
+3. **`ForwardingLog`**: Tracks delivery history and guards against duplicate forwards.
+   - `id`: UUID Primary Key
+   - `sourceChatId`: BigInt
+   - `sourceMessageId`: Int
+   - `destinationGroupId`: Foreign Key referencing `DestinationGroup.id` (`onDelete: Cascade`)
+   - `status`: `ForwardingStatus` enum (`SUCCESS`, `FAILED`)
+   - `errorMessage`: Optional text describing failures
+   - Unique: `(sourceChatId, sourceMessageId, destinationGroupId)`
+
+### Prisma 7 Commands
+
+- **Validate schema**:
+  ```bash
+  npx prisma validate
+  ```
+- **Apply migrations**:
+  ```bash
+  npx prisma migrate dev --name init_database
+  ```
+- **Generate Prisma Client**:
+  ```bash
+  npx prisma generate
+  ```
 
 ---
 
