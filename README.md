@@ -251,6 +251,72 @@ The message forwarding engine ([src/services/forwarding.service.ts](file:///home
 
 ---
 
+## Media Types, Media Albums, and Telegram Message Edge Cases
+
+The distribution pipeline natively supports different message types and Telegram-specific operational edge cases:
+
+### 1. Supported Message Types
+All message types are forwarded natively via Telegram Bot API without re-uploading or downloading files:
+- **Text Announcements**: Plain text with formatting entities (bold, italic, monospace, links).
+- **Photos**: Single photos with or without captions.
+- **Documents**: PDFs, Word documents, slide decks, ZIP archives, spreadsheets.
+- **Videos**: MP4/MOV videos with captions.
+- **Audio Files**: MP3, podcasts, or music files.
+- **Voice Messages**: OGG/Opus voice notes with waveforms preserved.
+- **Video Messages (Video Notes)**: Circular round video clips.
+- **Stickers**: Static, animated (TGS), and video stickers (WEBM).
+- **Animations**: GIFs with captions.
+- **Polls**: Regular and quiz polls.
+- **Contacts, Locations, Venues, and Dice**: Embedded native Telegram objects.
+
+### 2. Media Album Collection and Batching Strategy
+Telegram delivers media group items (albums of photos or videos) as individual message updates rather than a single atomic update.
+- **Sliding Debounce Window**: [src/services/album.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/album.service.ts) accumulates messages sharing the same `media_group_id` using a configurable sliding debounce window (default **500ms**).
+- **Hard Ceiling**: A maximum ceiling (default **2500ms**) prevents indefinite waiting if network delays occur.
+- **Trade-off Analysis**: A collection window of 500ms strikes the optimal balance between waiting for all updates to arrive over the network and maintaining near-instantaneous forwarding delivery.
+- **Sequence Preservation**: Message IDs are sorted in strictly ascending order before forwarding.
+- **Atomic Forwarding**: Uses Telegram's native `telegram.forwardMessages(destChatId, srcChatId, messageIds)` API, keeping the album grouped in destination groups.
+- **Duplicate Prevention**: Memory cache of recently finalized `media_group_id` keys prevents late-arriving updates from re-triggering distribution.
+
+### 3. Handling Telegram Forwarding Limitations & Protected Content
+- **Protected Content**: Groups or channels with "Restrict saving content" enabled reject forwarding with `CHAT_FORWARDS_RESTRICTED`. The system classifies this error (`PROTECTED_CONTENT`), logs the event, and continues to remaining destinations without crashing.
+- **Missing / Deleted Messages**: Handled via `MESSAGE_NOT_FOUND` without interrupting the batch.
+- **Unauthorized / Removed Bot**: When a bot is kicked from a destination group, it is categorized as `BOT_NOT_MEMBER`, allowing other destinations to receive the announcement cleanly.
+
+### 4. Rate-Limit Handling
+- **Recognition**: Telegram Bot API 429 errors (`Too Many Requests: retry after X`) and `parameters.retry_after` are parsed automatically into `retryAfterSeconds`.
+- **Sequential Backoff**: If rate-limited on a destination, the system pauses execution for `retryAfterSeconds` (capped at a safe ceiling of 10s) before attempting subsequent destinations.
+- **Burst Mitigation**: A gentle delay (`interDestinationDelayMs = 50ms` in production, `0ms` in test mode) paces delivery across multi-group broadcasts.
+
+---
+
+## Manual Testing Checklist (Real Telegram Verification)
+
+To test the system manually in live Telegram groups:
+
+1. **Text Announcement**: Post a text message in the registered source topic; verify all active destination groups receive the forwarded message with source attribution.
+2. **Photo with Caption**: Post a photo with an explanatory caption; verify destination groups receive the image with caption intact.
+3. **Multiple Photos in One Album**: Post an album of 3–5 photos; verify that destinations receive the album grouped as a single media group and only once.
+4. **PDF Document**: Upload a PDF file in the source topic; verify that students can download and open the document directly.
+5. **Video**: Post a video with caption; verify video playback and caption are preserved in destinations.
+6. **Voice Message**: Record and send a voice memo; verify audio playback in destination groups.
+7. **Sticker**: Send a sticker; verify it appears in all destination groups.
+8. **Protected Content**: Forward a message from a channel with restricted saving; verify the system logs `PROTECTED_CONTENT` and does not crash.
+9. **Multi-Destination Album Delivery**: Verify an album reaches multiple registered groups concurrently.
+10. **Partial Failure**: Remove the bot from one destination group; post an announcement and verify remaining destination groups still receive the message.
+11. **Rate-Limit Handling**: Broadcast an announcement to multiple destinations; verify logs demonstrate steady pacing without Telegram 429 drops.
+12. **Source Topic Isolation**: Register two source topics (e.g. Topic A and Topic B with separate destination groups); post in Topic A and verify Topic B destinations receive nothing.
+
+---
+
+## Known Reliability Limitations
+
+1. **In-Memory Album Buffer**: Album collection is kept in memory. If the bot crashes during the 500ms collection window, pending album items are lost. (Persistent queuing will be addressed in future phases).
+2. **Sequential Delivery Loop**: Delivery to multiple destinations occurs sequentially in the event loop. While simple and memory-efficient, distributing to hundreds of groups would benefit from a dedicated background worker queue (e.g. BullMQ / Redis).
+3. **No Database Forwarding Audit Logs**: In accordance with Day 2 requirements, delivery results are returned in memory and not yet committed to the `ForwardingLog` database table.
+
+---
+
 ## Destination Group Management
 
 Destination groups represent the student project groups that receive announcements:

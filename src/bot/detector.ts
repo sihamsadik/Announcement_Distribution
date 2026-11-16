@@ -10,6 +10,7 @@ export interface DetectedAnnouncement {
   contentType: string;
   hasMedia: boolean;
   contentPreview?: string;
+  mediaGroupId?: string;
 }
 
 /**
@@ -28,12 +29,18 @@ export function getMessageContentType(message: any): { contentType: string; hasM
   const captionPreview = message.caption ? (message.caption.length > 50 ? `${message.caption.substring(0, 47)}...` : message.caption) : undefined;
 
   if (message.photo) return { contentType: 'photo', hasMedia: true, preview: captionPreview };
-  if (message.document) return { contentType: 'document', hasMedia: true, preview: captionPreview };
+  if (message.document) return { contentType: 'document', hasMedia: true, preview: captionPreview || message.document.file_name };
   if (message.video) return { contentType: 'video', hasMedia: true, preview: captionPreview };
   if (message.animation) return { contentType: 'animation', hasMedia: true, preview: captionPreview };
-  if (message.audio) return { contentType: 'audio', hasMedia: true, preview: captionPreview };
-  if (message.voice) return { contentType: 'voice', hasMedia: true, preview: captionPreview };
+  if (message.audio) return { contentType: 'audio', hasMedia: true, preview: captionPreview || message.audio.title };
+  if (message.voice) return { contentType: 'voice', hasMedia: true, preview: captionPreview || 'Voice message' };
+  if (message.video_note) return { contentType: 'video_note', hasMedia: true, preview: 'Video message' };
+  if (message.sticker) return { contentType: 'sticker', hasMedia: true, preview: message.sticker.emoji ? `Sticker ${message.sticker.emoji}` : 'Sticker' };
   if (message.poll) return { contentType: 'poll', hasMedia: false, preview: message.poll.question };
+  if (message.contact) return { contentType: 'contact', hasMedia: false, preview: `${message.contact.first_name || ''} ${message.contact.last_name || ''}`.trim() || 'Contact' };
+  if (message.location) return { contentType: 'location', hasMedia: false, preview: `Location: (${message.location.latitude}, ${message.location.longitude})` };
+  if (message.venue) return { contentType: 'venue', hasMedia: false, preview: `Venue: ${message.venue.title}` };
+  if (message.dice) return { contentType: 'dice', hasMedia: false, preview: `Dice: ${message.dice.emoji}` };
 
   return { contentType: 'other', hasMedia: false };
 }
@@ -75,10 +82,11 @@ export async function detectSourceAnnouncement(ctx: Context): Promise<DetectedAn
 
   // 5. Source matched! Extract message metadata
   const { contentType, hasMedia, preview } = getMessageContentType(message);
+  const mediaGroupId = (message as any).media_group_id ? String((message as any).media_group_id) : undefined;
 
   console.log(
     `[SourceDetector] 📢 Recognized announcement in registered source "${sourceGroup.name}" ` +
-    `(Chat: ${chat.id}, Topic: ${topicId}, Message: #${message.message_id}, Type: ${contentType})`
+    `(Chat: ${chat.id}, Topic: ${topicId}, Message: #${message.message_id}, Type: ${contentType}${mediaGroupId ? `, MediaGroup: ${mediaGroupId}` : ''})`
   );
 
   return {
@@ -89,5 +97,6 @@ export async function detectSourceAnnouncement(ctx: Context): Promise<DetectedAn
     contentType,
     hasMedia,
     contentPreview: preview,
+    mediaGroupId,
   };
 }
