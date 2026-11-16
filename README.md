@@ -161,6 +161,41 @@ The application uses **PostgreSQL** and **Prisma 7** for data persistence.
 
 ---
 
+## Source Group & Topic Detection
+
+The system can monitor specific Telegram forum topics within course supergroups to identify new announcements.
+
+### How It Works
+
+1. **Registration**: An authorized administrator runs `/register_source` inside the course forum topic (or specifies the topic ID explicitly). The group's `chatId` and `topicId` are stored in the `SourceGroup` table.
+2. **Detection**: Whenever a new message arrives in a group:
+   - The bot extracts `chat.id` and `message_thread_id`.
+   - Messages from private chats, unregistered groups, or non-topic messages are safely ignored.
+   - If the `(chatId, topicId)` pair matches a registered source, the message is recognized and logged as a new announcement.
+3. **Authorization**:
+   - Only users whose IDs are defined in `ADMIN_USER_IDS` or users who are Administrators in the Telegram group can register sources.
+
+### Bot Commands
+
+| Command | Description | Permissions |
+| :--- | :--- | :--- |
+| `/start` | Introduces the bot and welcome message | Public |
+| `/help` | Explains bot features and registration commands | Public |
+| `/register_source [topicId] <name>` | Registers the current group topic as an announcement source | Admins Only |
+| `/list_sources` | Displays all registered source groups and topics | Admins Only |
+
+#### Usage Examples:
+- **Inside a forum topic**:
+  ```text
+  /register_source Final Project Announcements
+  ```
+- **With explicit topic ID** (recommended if outside topic or in general chat):
+  ```text
+  /register_source 42 Final Project Announcements
+  ```
+
+---
+
 ## Running the Application
 
 ### Development Mode (with hot-reloading via `tsx`):
