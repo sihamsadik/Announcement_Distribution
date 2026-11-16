@@ -7,6 +7,7 @@ datasource db {
 }
 
 enum ForwardingStatus {
+  PENDING
   SUCCESS
   FAILED
 }
@@ -48,6 +49,7 @@ model ForwardingLog {
   status             ForwardingStatus
   errorMessage       String?
   createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt @default(now())
 
   destinationGroup DestinationGroup @relation(fields: [destinationGroupId], references: [id], onDelete: Cascade)
 

@@ -309,11 +309,42 @@ To test the system manually in live Telegram groups:
 
 ---
 
+## Persistent Delivery Tracking and Duplicate Prevention (Idempotency)
+
+The delivery tracking engine ([src/services/delivery.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/delivery.service.ts)) integrates directly with the PostgreSQL `ForwardingLog` model to enforce idempotency and prevent duplicate deliveries across restarts and re-delivered Telegram updates:
+
+### 1. Delivery Status Lifecycle
+Each forwarding attempt transitions through an explicit lifecycle:
+- **`PENDING`**: Atomically recorded before calling the Telegram Bot API. Indicates a delivery is currently in flight.
+- **`SUCCESS`**: Recorded when Telegram acknowledges delivery (`telegram.forwardMessage` or `telegram.forwardMessages` returns successfully).
+- **`FAILED`**: Recorded when Telegram rejects the forward (e.g. `BOT_NOT_MEMBER`, `PERMISSION_DENIED`, `PROTECTED_CONTENT`), storing an error description.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: claimDelivery() / claimAlbumDelivery()
+    PENDING --> SUCCESS: telegram.forwardMessage() succeeds
+    PENDING --> FAILED: telegram.forwardMessage() fails
+    FAILED --> PENDING: Administrator retry
+    PENDING --> PENDING: Stale reclaim (>60s crash recovery)
+    SUCCESS --> [*]: Terminal (never re-delivered)
+```
+
+### 2. Idempotency & Concurrency Safety
+- **Unique Database Constraint**: PostgreSQL enforces `@@unique([sourceChatId, sourceMessageId, destinationGroupId])`. At most one delivery record can ever exist for a message-destination pair.
+- **Pre-Execution Check**: Before calling Telegram, the system checks whether a `SUCCESS` record already exists. If found, the destination is skipped immediately.
+- **Atomic Concurrency Gate**: If two processes attempt to deliver the same message simultaneously, the PostgreSQL unique index causes the second `create` to fail with Prisma error `P2002`. The catch handler resolves the race condition cleanly without duplicating messages.
+- **Recovery of Interrupted Processing**: If a worker crashes while a delivery is `PENDING`, the record becomes stale after 60 seconds (`updatedAt` threshold). On subsequent runs, `claimDelivery` identifies stale pending records and reclaims them safely.
+
+### 3. Media Album Tracking
+For Telegram media groups (albums with multiple photos/videos), each individual message ID within the album is tracked with its own record in `ForwardingLog`. An album is skipped only when all of its member message IDs have succeeded. If an album forward fails, all member items are transitioned to `FAILED`.
+
+---
+
 ## Known Reliability Limitations
 
-1. **In-Memory Album Buffer**: Album collection is kept in memory. If the bot crashes during the 500ms collection window, pending album items are lost. (Persistent queuing will be addressed in future phases).
-2. **Sequential Delivery Loop**: Delivery to multiple destinations occurs sequentially in the event loop. While simple and memory-efficient, distributing to hundreds of groups would benefit from a dedicated background worker queue (e.g. BullMQ / Redis).
-3. **No Database Forwarding Audit Logs**: In accordance with Day 2 requirements, delivery results are returned in memory and not yet committed to the `ForwardingLog` database table.
+1. **In-Memory Album Debounce Buffer**: Media album collection accumulates items in an in-memory buffer for 500ms before dispatching. If the bot crashes during the 500ms collection window, pending unforwarded album updates in memory are discarded until re-posted.
+2. **Sequential Delivery Loop**: Delivery across destination groups is executed sequentially in the event loop with polite pacing (`50ms`). For large-scale broadcasts across hundreds of groups, a distributed background queue (e.g. BullMQ / Redis) would provide asynchronous sharding.
+3. **Database Idempotency vs Exactly-Once External Delivery**: The database unique constraint guarantees that the *local database* records at most one delivery. However, because external network calls cannot participate in a two-phase commit with Telegram's servers, a crash occurring precisely between Telegram receiving a message and PostgreSQL committing `SUCCESS` could result in an at-least-once re-send upon crash recovery.
 
 ---
 

@@ -1,0 +1,5 @@
+-- AlterEnum
+ALTER TYPE "ForwardingStatus" ADD VALUE 'PENDING';
+
+-- AlterTable
+ALTER TABLE "ForwardingLog" ADD COLUMN     "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;

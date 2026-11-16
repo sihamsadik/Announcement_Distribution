@@ -3,6 +3,7 @@ import { SourceGroup } from '@prisma/client';
 import { destinationService, DestinationService } from './destination.service';
 import { forwardingService, ForwardingService, ForwardErrorType } from './forwarding.service';
 import { albumService, AlbumService } from './album.service';
+import { deliveryService, DeliveryService } from './delivery.service';
 import { detectSourceAnnouncement } from '../bot/detector';
 import { sanitizeError } from '../bot/bot';
 
@@ -11,6 +12,8 @@ export interface DestinationDeliveryResult {
   destinationChatId: bigint;
   groupName: string;
   success: boolean;
+  skipped?: boolean;
+  skipReason?: string;
   forwardedMessageId?: number;
   forwardedMessageIds?: number[];
   errorType?: ForwardErrorType;
@@ -31,22 +34,34 @@ export interface DistributionSummary {
   totalDestinations: number;
   successfulCount: number;
   failedCount: number;
+  skippedCount: number;
   results: DestinationDeliveryResult[];
 }
 
 export class DistributionService {
   private readonly interDestinationDelayMs: number;
   private readonly maxBackoffMs: number;
+  private readonly delivService: DeliveryService;
 
   constructor(
     private readonly destService: DestinationService = destinationService,
     private readonly fwdService: ForwardingService = forwardingService,
     private readonly albService: AlbumService = albumService,
-    interDestinationDelayMs = process.env.NODE_ENV === 'test' ? 0 : 50,
+    delivServiceOrDelay: DeliveryService | number = deliveryService,
+    interDestinationDelayMs?: number,
     maxBackoffMs = 10000
   ) {
-    this.interDestinationDelayMs = interDestinationDelayMs;
-    this.maxBackoffMs = maxBackoffMs;
+    if (typeof delivServiceOrDelay === 'number') {
+      this.delivService = deliveryService;
+      this.interDestinationDelayMs = delivServiceOrDelay;
+      this.maxBackoffMs = interDestinationDelayMs !== undefined ? interDestinationDelayMs : maxBackoffMs;
+    } else {
+      this.delivService = delivServiceOrDelay;
+      this.interDestinationDelayMs = interDestinationDelayMs !== undefined
+        ? interDestinationDelayMs
+        : (process.env.NODE_ENV === 'test' ? 0 : 50);
+      this.maxBackoffMs = maxBackoffMs;
+    }
 
     // Register this distribution service's album handler with the album service
     this.albService.setDefaultDistributionHandler(this.distributeAlbum.bind(this));
@@ -88,8 +103,12 @@ export class DistributionService {
   /**
    * Central distribution logic for single messages (text, single photo, document, video, sticker, etc.).
    *
-   * Continues on partial failure so one unreachable group does not block others.
-   * Backs off safely when encountering Telegram rate limits (429 retry-after).
+   * Idempotency & Delivery Tracking:
+   * 1. Checks persistent delivery records in ForwardingLog.
+   * 2. Skips destinations that already have a SUCCESS record.
+   * 3. Creates/updates PENDING record atomically before sending.
+   * 4. Updates record to SUCCESS or FAILED upon completion.
+   * 5. Continues on partial failure so one unreachable group does not block others.
    */
   async distributeAnnouncement(
     telegram: Telegram,
@@ -129,6 +148,7 @@ export class DistributionService {
       totalDestinations: activeDestinations.length,
       successfulCount: 0,
       failedCount: 0,
+      skippedCount: 0,
       results: [],
     };
 
@@ -148,6 +168,46 @@ export class DistributionService {
     for (let i = 0; i < activeDestinations.length; i++) {
       const destination = activeDestinations[i];
       try {
+        // Step A: Idempotency & Concurrency Check via DeliveryService
+        const claim = await this.delivService.claimDelivery(sourceGroup.chatId, messageId, destination.id);
+
+        if (!claim.canDeliver) {
+          if (claim.reason === 'ALREADY_DELIVERED') {
+            console.log(
+              `[DistributionService Idempotency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+              `Message #${messageId} from chat ${sourceGroup.chatId} was already successfully delivered.`
+            );
+            summary.skippedCount++;
+            summary.results.push({
+              destinationId: destination.id,
+              destinationChatId: destination.chatId,
+              groupName: destination.groupName,
+              success: true,
+              skipped: true,
+              skipReason: 'Already delivered (Idempotency)',
+            });
+            continue;
+          }
+
+          if (claim.reason === 'ALREADY_PENDING') {
+            console.log(
+              `[DistributionService Concurrency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+              `Message #${messageId} is currently being processed by another worker.`
+            );
+            summary.skippedCount++;
+            summary.results.push({
+              destinationId: destination.id,
+              destinationChatId: destination.chatId,
+              groupName: destination.groupName,
+              success: false,
+              skipped: true,
+              skipReason: 'Delivery currently in flight',
+            });
+            continue;
+          }
+        }
+
+        // Step B: Attempt Forwarding
         const forwardResult = await this.fwdService.forwardMessage(
           telegram,
           {
@@ -159,6 +219,9 @@ export class DistributionService {
         );
 
         if (forwardResult.success) {
+          // Step C1: Mark SUCCESS in database
+          await this.delivService.markSuccess(sourceGroup.chatId, messageId, destination.id);
+
           summary.successfulCount++;
           summary.results.push({
             destinationId: destination.id,
@@ -169,6 +232,14 @@ export class DistributionService {
             forwardedMessageIds: forwardResult.forwardedMessageIds,
           });
         } else {
+          // Step C2: Mark FAILED in database
+          await this.delivService.markFailure(
+            sourceGroup.chatId,
+            messageId,
+            destination.id,
+            forwardResult.errorMessage || 'Unknown forward failure'
+          );
+
           summary.failedCount++;
           summary.results.push({
             destinationId: destination.id,
@@ -192,10 +263,14 @@ export class DistributionService {
         }
       } catch (err) {
         // Fallback resilience: catch unexpected errors to guarantee loop continuation
-        const sanitized = sanitizeError(err, token);
+        const sanitized = sanitizeError(err, actualToken);
         console.error(
           `[DistributionService Error] Unexpected error forwarding to "${destination.groupName}" (${destination.chatId}): ${sanitized}`
         );
+
+        // Record failure in database
+        await this.delivService.markFailure(sourceGroup.chatId, messageId, destination.id, sanitized).catch(() => {});
+
         summary.failedCount++;
         summary.results.push({
           destinationId: destination.id,
@@ -215,7 +290,8 @@ export class DistributionService {
 
     console.log(
       `[DistributionService] ✅ Finished distribution for message #${messageId} from "${sourceGroup.name}": ` +
-      `${summary.successfulCount}/${summary.totalDestinations} successful, ${summary.failedCount} failed.`
+      `${summary.successfulCount} successful, ${summary.failedCount} failed, ${summary.skippedCount} skipped ` +
+      `(out of ${summary.totalDestinations} total).`
     );
 
     return summary;
@@ -224,6 +300,12 @@ export class DistributionService {
   /**
    * Central distribution logic for Telegram media groups (albums).
    * Forwards multiple messages atomically using native forwardMessages, preserving grouping and order.
+   *
+   * Idempotency & Delivery Tracking:
+   * 1. Checks if all items in the album were already successfully delivered to the destination.
+   * 2. Claims all item message IDs as PENDING in ForwardingLog.
+   * 3. Forwards atomically via forwardMessages.
+   * 4. Updates all item records to SUCCESS or FAILED in database.
    */
   async distributeAlbum(
     telegram: Telegram,
@@ -255,6 +337,7 @@ export class DistributionService {
       totalDestinations: activeDestinations.length,
       successfulCount: 0,
       failedCount: 0,
+      skippedCount: 0,
       results: [],
     };
 
@@ -273,6 +356,46 @@ export class DistributionService {
     for (let i = 0; i < activeDestinations.length; i++) {
       const destination = activeDestinations[i];
       try {
+        // Step A: Idempotency check for the album items
+        const claim = await this.delivService.claimAlbumDelivery(sourceGroup.chatId, sortedIds, destination.id);
+
+        if (!claim.canDeliver) {
+          if (claim.reason === 'ALREADY_DELIVERED') {
+            console.log(
+              `[DistributionService Idempotency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+              `Album ${mediaGroupId} was already successfully delivered.`
+            );
+            summary.skippedCount++;
+            summary.results.push({
+              destinationId: destination.id,
+              destinationChatId: destination.chatId,
+              groupName: destination.groupName,
+              success: true,
+              skipped: true,
+              skipReason: 'Album already delivered (Idempotency)',
+            });
+            continue;
+          }
+
+          if (claim.reason === 'ALREADY_PENDING') {
+            console.log(
+              `[DistributionService Concurrency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+              `Album ${mediaGroupId} is currently being processed by another worker.`
+            );
+            summary.skippedCount++;
+            summary.results.push({
+              destinationId: destination.id,
+              destinationChatId: destination.chatId,
+              groupName: destination.groupName,
+              success: false,
+              skipped: true,
+              skipReason: 'Album delivery currently in flight',
+            });
+            continue;
+          }
+        }
+
+        // Step B: Forward album atomically
         const forwardResult = await this.fwdService.forwardMessages(
           telegram,
           {
@@ -284,6 +407,9 @@ export class DistributionService {
         );
 
         if (forwardResult.success) {
+          // Step C1: Mark SUCCESS for all items in database
+          await this.delivService.markAlbumSuccess(sourceGroup.chatId, sortedIds, destination.id);
+
           summary.successfulCount++;
           summary.results.push({
             destinationId: destination.id,
@@ -294,6 +420,14 @@ export class DistributionService {
             forwardedMessageIds: forwardResult.forwardedMessageIds,
           });
         } else {
+          // Step C2: Mark FAILED for all items in database
+          await this.delivService.markAlbumFailure(
+            sourceGroup.chatId,
+            sortedIds,
+            destination.id,
+            forwardResult.errorMessage || 'Unknown forwardMessages failure'
+          );
+
           summary.failedCount++;
           summary.results.push({
             destinationId: destination.id,
@@ -320,6 +454,9 @@ export class DistributionService {
         console.error(
           `[DistributionService Error] Unexpected error forwarding album to "${destination.groupName}" (${destination.chatId}): ${sanitized}`
         );
+
+        await this.delivService.markAlbumFailure(sourceGroup.chatId, sortedIds, destination.id, sanitized).catch(() => {});
+
         summary.failedCount++;
         summary.results.push({
           destinationId: destination.id,
@@ -339,7 +476,8 @@ export class DistributionService {
 
     console.log(
       `[DistributionService] ✅ Finished album distribution for ${mediaGroupId} from "${sourceGroup.name}": ` +
-      `${summary.successfulCount}/${summary.totalDestinations} successful, ${summary.failedCount} failed.`
+      `${summary.successfulCount} successful, ${summary.failedCount} failed, ${summary.skippedCount} skipped ` +
+      `(out of ${summary.totalDestinations} total).`
     );
 
     return summary;
@@ -350,7 +488,7 @@ export class DistributionService {
    * 1. Validates eligibility (no bot loops, no commands).
    * 2. Detects registered source topic.
    * 3. For media albums: routes to album collection service with sliding debounce.
-   * 4. For standalone messages: immediately distributes to active destinations.
+   * 4. For standalone messages: immediately distributes to active destinations with idempotency.
    */
   async processIncomingMessage(
     ctx: Context,
