@@ -1,6 +1,7 @@
 import { loadConfig } from './config/env';
 import { createBot, sanitizeError } from './bot/bot';
 import { checkDatabaseConnection, disconnectPrisma } from './db/prisma';
+import { retryService } from './services/retry.service';
 
 async function main(): Promise<void> {
   let token = '';
@@ -24,6 +25,7 @@ async function main(): Promise<void> {
     const shutdown = async (signal: string) => {
       console.log(`\n[Shutdown] Received ${signal}. Gracefully stopping application...`);
       try {
+        retryService.stopPolling();
         bot.stop(signal);
         await disconnectPrisma();
         console.log('[Shutdown] Bot stopped and database disconnected cleanly.');
@@ -45,6 +47,9 @@ async function main(): Promise<void> {
     const botInfo = await bot.telegram.getMe();
     console.log(`[Bot Ready] Telegram Bot started successfully as @${botInfo.username} (ID: ${botInfo.id})`);
     console.log('[Bot Ready] Listening for commands and registered source announcements.');
+
+    // 5. Start background retry polling and run startup recovery
+    retryService.startPolling(bot.telegram, token);
   } catch (err) {
     const safeMsg = sanitizeError(err, token);
     console.error(`[Fatal Startup Error] Failed to start application: ${safeMsg}`);

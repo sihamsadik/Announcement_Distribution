@@ -8,6 +8,7 @@ datasource db {
 
 enum ForwardingStatus {
   PENDING
+  RETRYING
   SUCCESS
   FAILED
 }
@@ -48,6 +49,9 @@ model ForwardingLog {
   destinationGroupId String
   status             ForwardingStatus
   errorMessage       String?
+  retryCount         Int              @default(0)
+  lastAttemptAt      DateTime         @default(now())
+  nextRetryAt        DateTime?
   createdAt          DateTime         @default(now())
   updatedAt          DateTime         @updatedAt @default(now())
 
@@ -58,4 +62,5 @@ model ForwardingLog {
   @@index([status])
   @@index([createdAt])
   @@index([sourceChatId, sourceMessageId])
+  @@index([status, nextRetryAt])
 }

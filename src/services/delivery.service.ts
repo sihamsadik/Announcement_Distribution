@@ -1,5 +1,6 @@
 import { ForwardingStatus, ForwardingLog } from '@prisma/client';
 import { prisma } from '../db/prisma';
+import { calculateNextRetryDelay } from './retry.service';
 
 export interface ClaimResult {
   canDeliver: boolean;
@@ -48,13 +49,16 @@ export class DeliveryService {
   /**
    * Atomically claims delivery for a source message to a destination group.
    *
-   * Idempotency guarantee:
-   * 1. If a record already exists with status SUCCESS, returns canDeliver = false.
-   * 2. If a record exists with status PENDING and was recently updated (< stale threshold),
-   *    returns canDeliver = false (concurrent delivery in flight).
-   * 3. If a record exists with status FAILED or stale PENDING, transitions to PENDING and returns canDeliver = true.
-   * 4. If no record exists, inserts PENDING. Catches PostgreSQL unique constraint violation (P2002)
-   *    if a concurrent worker inserted simultaneously, and resolves safely.
+   * Idempotency & Lifecycle rules:
+   * 1. If status === SUCCESS: returns canDeliver = false (ALREADY_DELIVERED).
+   * 2. If status === RETRYING:
+   *    - If nextRetryAt > now: returns canDeliver = false (waiting for backoff delay).
+   *    - If nextRetryAt <= now: claims as PENDING and returns canDeliver = true (scheduled retry arrived).
+   * 3. If status === PENDING:
+   *    - If updated recently (< stale threshold): returns canDeliver = false (ALREADY_PENDING).
+   *    - If stale (>= stale threshold): reclaims as PENDING (crash recovery).
+   * 4. If status === FAILED: reclaims as PENDING (allows manual retry).
+   * 5. If no record: creates PENDING. Catches PostgreSQL unique constraint (P2002) for concurrency.
    */
   async claimDelivery(
     sourceChatId: bigint | number | string,
@@ -80,6 +84,29 @@ export class DeliveryService {
           return { canDeliver: false, reason: 'ALREADY_DELIVERED', existingLog: existing };
         }
 
+        if (existing.status === ForwardingStatus.RETRYING) {
+          const now = new Date();
+          if (existing.nextRetryAt && existing.nextRetryAt > now) {
+            // Still waiting for backoff window
+            return { canDeliver: false, reason: 'ALREADY_PENDING', existingLog: existing };
+          }
+
+          // Retry time has arrived: claim as PENDING
+          console.log(
+            `[DeliveryService] Claiming scheduled RETRYING delivery (${existing.id}) for message #${sourceMessageId} ` +
+            `to destination ${destinationGroupId} (Attempt ${existing.retryCount + 1}).`
+          );
+          const updated = await prisma.forwardingLog.update({
+            where: { id: existing.id },
+            data: {
+              status: ForwardingStatus.PENDING,
+              lastAttemptAt: new Date(),
+              updatedAt: new Date(),
+            },
+          });
+          return { canDeliver: true, logId: updated.id, isRetry: true };
+        }
+
         if (existing.status === ForwardingStatus.PENDING) {
           const elapsed = Date.now() - existing.updatedAt.getTime();
           if (elapsed < this.stalePendingThresholdMs) {
@@ -97,6 +124,7 @@ export class DeliveryService {
             data: {
               status: ForwardingStatus.PENDING,
               errorMessage: null,
+              lastAttemptAt: new Date(),
               updatedAt: new Date(),
             },
           });
@@ -114,6 +142,7 @@ export class DeliveryService {
             data: {
               status: ForwardingStatus.PENDING,
               errorMessage: null,
+              lastAttemptAt: new Date(),
               updatedAt: new Date(),
             },
           });
@@ -128,6 +157,7 @@ export class DeliveryService {
           sourceMessageId,
           destinationGroupId,
           status: ForwardingStatus.PENDING,
+          lastAttemptAt: new Date(),
         },
       });
 
@@ -181,6 +211,8 @@ export class DeliveryService {
       update: {
         status: ForwardingStatus.SUCCESS,
         errorMessage: null,
+        nextRetryAt: null,
+        lastAttemptAt: new Date(),
         updatedAt: new Date(),
       },
       create: {
@@ -188,20 +220,59 @@ export class DeliveryService {
         sourceMessageId,
         destinationGroupId,
         status: ForwardingStatus.SUCCESS,
+        lastAttemptAt: new Date(),
       },
     });
   }
 
   /**
-   * Marks a delivery attempt as FAILED with an error description.
+   * Handles delivery failure:
+   * If error is transient and retryCount < maxRetries -> transitions to RETRYING with exponential backoff.
+   * If error is permanent or retryCount >= maxRetries -> transitions to FAILED (terminal).
    */
   async markFailure(
     sourceChatId: bigint | number | string,
     sourceMessageId: number,
     destinationGroupId: string,
-    errorMessage: string
+    errorMessage: string,
+    isTransient = false,
+    retryAfterSeconds?: number,
+    maxRetries = 3
   ): Promise<ForwardingLog> {
     const bigSourceChatId = BigInt(sourceChatId);
+
+    const existing = await prisma.forwardingLog.findUnique({
+      where: {
+        sourceChatId_sourceMessageId_destinationGroupId: {
+          sourceChatId: bigSourceChatId,
+          sourceMessageId,
+          destinationGroupId,
+        },
+      },
+    });
+
+    const currentRetryCount = existing ? existing.retryCount : 0;
+    const nextAttemptCount = currentRetryCount + 1;
+
+    let targetStatus: ForwardingStatus;
+    let nextRetryAt: Date | null = null;
+
+    if (isTransient && nextAttemptCount < maxRetries) {
+      targetStatus = ForwardingStatus.RETRYING;
+      const delayMs = calculateNextRetryDelay(nextAttemptCount, retryAfterSeconds);
+      nextRetryAt = new Date(Date.now() + delayMs);
+      console.log(
+        `[DeliveryService] Scheduling transient retry (${nextAttemptCount}/${maxRetries}) for message #${sourceMessageId} ` +
+        `to destination ${destinationGroupId}. Next retry in ${Math.round(delayMs / 1000)}s.`
+      );
+    } else {
+      targetStatus = ForwardingStatus.FAILED;
+      nextRetryAt = null;
+      console.warn(
+        `[DeliveryService] Delivery marked FAILED for message #${sourceMessageId} to destination ${destinationGroupId}. ` +
+        `Transient: ${isTransient}, Attempts: ${nextAttemptCount}/${maxRetries}`
+      );
+    }
 
     return await prisma.forwardingLog.upsert({
       where: {
@@ -212,16 +283,22 @@ export class DeliveryService {
         },
       },
       update: {
-        status: ForwardingStatus.FAILED,
-        errorMessage: errorMessage.substring(0, 1000), // bounded error length
+        status: targetStatus,
+        retryCount: nextAttemptCount,
+        nextRetryAt,
+        errorMessage: errorMessage.substring(0, 1000),
+        lastAttemptAt: new Date(),
         updatedAt: new Date(),
       },
       create: {
         sourceChatId: bigSourceChatId,
         sourceMessageId,
         destinationGroupId,
-        status: ForwardingStatus.FAILED,
+        status: targetStatus,
+        retryCount: nextAttemptCount,
+        nextRetryAt,
         errorMessage: errorMessage.substring(0, 1000),
+        lastAttemptAt: new Date(),
       },
     });
   }
@@ -256,12 +333,19 @@ export class DeliveryService {
       };
     }
 
-    // Check if any album item is currently PENDING by an active concurrent worker
-    const activePending = existingLogs.find(
-      (l) => l.status === ForwardingStatus.PENDING && (Date.now() - l.updatedAt.getTime()) < this.stalePendingThresholdMs
-    );
+    // Check if any album item is currently PENDING or RETRYING (and backoff has not expired)
+    const now = new Date();
+    const activePendingOrRetrying = existingLogs.find((l) => {
+      if (l.status === ForwardingStatus.PENDING) {
+        return (Date.now() - l.updatedAt.getTime()) < this.stalePendingThresholdMs;
+      }
+      if (l.status === ForwardingStatus.RETRYING) {
+        return l.nextRetryAt && l.nextRetryAt > now;
+      }
+      return false;
+    });
 
-    if (activePending) {
+    if (activePendingOrRetrying) {
       return {
         canDeliver: false,
         reason: 'ALREADY_PENDING',
@@ -285,6 +369,7 @@ export class DeliveryService {
           update: {
             status: ForwardingStatus.PENDING,
             errorMessage: null,
+            lastAttemptAt: new Date(),
             updatedAt: new Date(),
           },
           create: {
@@ -292,6 +377,7 @@ export class DeliveryService {
             sourceMessageId: msgId,
             destinationGroupId,
             status: ForwardingStatus.PENDING,
+            lastAttemptAt: new Date(),
           },
         });
         claimedIds.push(msgId);
@@ -321,16 +407,19 @@ export class DeliveryService {
   }
 
   /**
-   * Marks all items in a media album as FAILED with error message.
+   * Marks all items in a media album as FAILED or RETRYING.
    */
   async markAlbumFailure(
     sourceChatId: bigint | number | string,
     messageIds: number[],
     destinationGroupId: string,
-    errorMessage: string
+    errorMessage: string,
+    isTransient = false,
+    retryAfterSeconds?: number,
+    maxRetries = 3
   ): Promise<void> {
     for (const msgId of messageIds) {
-      await this.markFailure(sourceChatId, msgId, destinationGroupId, errorMessage);
+      await this.markFailure(sourceChatId, msgId, destinationGroupId, errorMessage, isTransient, retryAfterSeconds, maxRetries);
     }
   }
 

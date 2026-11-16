@@ -56,10 +56,10 @@ describe('Message Forwarding Engine', () => {
     });
 
     it('should classify unmapped errors as UNKNOWN_ERROR', () => {
-      const err = new Error('Internal Server Error 500');
+      const err = new Error('Some completely unexpected error occurred');
       const { errorType, message } = classifyTelegramError(err);
       expect(errorType).toBe(ForwardErrorType.UNKNOWN_ERROR);
-      expect(message).toBe('Internal Server Error 500');
+      expect(message).toBe('Some completely unexpected error occurred');
     });
   });
 

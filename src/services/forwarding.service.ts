@@ -1,5 +1,5 @@
 import { Telegram } from 'telegraf';
-import { sanitizeError } from '../bot/bot';
+import { sanitizeError } from '../utils/sanitize';
 
 export enum ForwardErrorType {
   BOT_NOT_MEMBER = 'BOT_NOT_MEMBER',
@@ -7,6 +7,8 @@ export enum ForwardErrorType {
   MESSAGE_NOT_FOUND = 'MESSAGE_NOT_FOUND',
   PROTECTED_CONTENT = 'PROTECTED_CONTENT',
   RATE_LIMITED = 'RATE_LIMITED',
+  NETWORK_ERROR = 'NETWORK_ERROR',
+  SERVER_ERROR = 'SERVER_ERROR',
   INVALID_CHAT_ID = 'INVALID_CHAT_ID',
   UNKNOWN_ERROR = 'UNKNOWN_ERROR',
 }
@@ -30,77 +32,48 @@ export interface ForwardResult {
   errorType?: ForwardErrorType;
   errorMessage?: string;
   rawError?: string;
+  isTransient?: boolean;
   retryAfterSeconds?: number;
 }
 
 export interface ClassifiedTelegramError {
   errorType: ForwardErrorType;
   message: string;
+  isTransient: boolean;
   retryAfterSeconds?: number;
 }
 
 /**
+ * Determines whether an error type is transient (retryable) or permanent (non-retryable).
+ */
+export function isTransientError(errorType: ForwardErrorType): boolean {
+  switch (errorType) {
+    case ForwardErrorType.RATE_LIMITED:
+    case ForwardErrorType.NETWORK_ERROR:
+    case ForwardErrorType.SERVER_ERROR:
+      return true;
+    case ForwardErrorType.BOT_NOT_MEMBER:
+    case ForwardErrorType.PERMISSION_DENIED:
+    case ForwardErrorType.PROTECTED_CONTENT:
+    case ForwardErrorType.MESSAGE_NOT_FOUND:
+    case ForwardErrorType.INVALID_CHAT_ID:
+    case ForwardErrorType.UNKNOWN_ERROR:
+    default:
+      return false;
+  }
+}
+
+/**
  * Classifies Telegram Bot API exceptions into structured, actionable error categories.
+ * Separates transient errors (rate-limits, network timeouts, 5xx server issues)
+ * from permanent errors (permissions, bot kicked, protected content).
  * Extracts retry_after parameters if rate limited.
  */
 export function classifyTelegramError(err: unknown): ClassifiedTelegramError {
   const errMsg = err instanceof Error ? err.message : String(err);
   const lower = errMsg.toLowerCase();
 
-  if (lower.includes('chat not found') || lower.includes('chat_id is empty') || lower.includes('peer_id_invalid')) {
-    return {
-      errorType: ForwardErrorType.INVALID_CHAT_ID,
-      message: 'Destination chat was not found or is invalid.',
-    };
-  }
-
-  if (
-    lower.includes('bot was kicked') ||
-    lower.includes('bot is not a member') ||
-    lower.includes('user not found') ||
-    lower.includes('bot was blocked')
-  ) {
-    return {
-      errorType: ForwardErrorType.BOT_NOT_MEMBER,
-      message: 'Bot is not a member of the destination group.',
-    };
-  }
-
-  if (
-    lower.includes('chat_write_forbidden') ||
-    lower.includes('not enough rights') ||
-    lower.includes('rights to send') ||
-    lower.includes('need administrator rights') ||
-    lower.includes('send_messages')
-  ) {
-    return {
-      errorType: ForwardErrorType.PERMISSION_DENIED,
-      message: 'Bot does not have permission to send messages in the destination group.',
-    };
-  }
-
-  if (
-    lower.includes('chat_forwards_restricted') ||
-    lower.includes("message can't be forwarded") ||
-    lower.includes('protected content')
-  ) {
-    return {
-      errorType: ForwardErrorType.PROTECTED_CONTENT,
-      message: 'The source message or chat has content protection enabled and cannot be forwarded.',
-    };
-  }
-
-  if (
-    lower.includes('message to forward not found') ||
-    lower.includes('message not found') ||
-    lower.includes('message can’t be found')
-  ) {
-    return {
-      errorType: ForwardErrorType.MESSAGE_NOT_FOUND,
-      message: 'The source message could not be found or has been deleted.',
-    };
-  }
-
+  // 1. Rate Limits (Transient)
   if (lower.includes('too many requests') || lower.includes('retry after')) {
     let retryAfterSeconds: number | undefined;
     const match = errMsg.match(/retry after (\d+)/i);
@@ -112,13 +85,116 @@ export function classifyTelegramError(err: unknown): ClassifiedTelegramError {
     return {
       errorType: ForwardErrorType.RATE_LIMITED,
       message: `Telegram API rate limit encountered.${retryAfterSeconds !== undefined ? ` Retry after ${retryAfterSeconds}s.` : ''}`,
+      isTransient: true,
       retryAfterSeconds,
     };
   }
 
+  // 2. Temporary Telegram Server Errors (Transient)
+  if (
+    lower.includes('500') ||
+    lower.includes('502') ||
+    lower.includes('503') ||
+    lower.includes('504') ||
+    lower.includes('internal server error') ||
+    lower.includes('bad gateway') ||
+    lower.includes('service unavailable') ||
+    lower.includes('gateway timeout')
+  ) {
+    return {
+      errorType: ForwardErrorType.SERVER_ERROR,
+      message: 'Temporary Telegram server error (5xx).',
+      isTransient: true,
+    };
+  }
+
+  // 3. Temporary Network Failures & Timeouts (Transient)
+  if (
+    lower.includes('etimedout') ||
+    lower.includes('econnreset') ||
+    lower.includes('econnrefused') ||
+    lower.includes('socket hang up') ||
+    lower.includes('network timeout') ||
+    lower.includes('fetch failed') ||
+    lower.includes('network error') ||
+    lower.includes('timeout')
+  ) {
+    return {
+      errorType: ForwardErrorType.NETWORK_ERROR,
+      message: 'Temporary network connection failure or timeout.',
+      isTransient: true,
+    };
+  }
+
+  // 4. Invalid Chat ID / Chat Not Found (Permanent)
+  if (lower.includes('chat not found') || lower.includes('chat_id is empty') || lower.includes('peer_id_invalid')) {
+    return {
+      errorType: ForwardErrorType.INVALID_CHAT_ID,
+      message: 'Destination chat was not found or is invalid.',
+      isTransient: false,
+    };
+  }
+
+  // 5. Bot Kicked or Blocked (Permanent)
+  if (
+    lower.includes('bot was kicked') ||
+    lower.includes('bot is not a member') ||
+    lower.includes('user not found') ||
+    lower.includes('bot was blocked')
+  ) {
+    return {
+      errorType: ForwardErrorType.BOT_NOT_MEMBER,
+      message: 'Bot is not a member of the destination group.',
+      isTransient: false,
+    };
+  }
+
+  // 6. Permission Denied / Write Forbidden (Permanent)
+  if (
+    lower.includes('chat_write_forbidden') ||
+    lower.includes('not enough rights') ||
+    lower.includes('rights to send') ||
+    lower.includes('need administrator rights') ||
+    lower.includes('send_messages')
+  ) {
+    return {
+      errorType: ForwardErrorType.PERMISSION_DENIED,
+      message: 'Bot does not have permission to send messages in the destination group.',
+      isTransient: false,
+    };
+  }
+
+  // 7. Protected Content (Permanent)
+  if (
+    lower.includes('chat_forwards_restricted') ||
+    lower.includes("message can't be forwarded") ||
+    lower.includes('protected content')
+  ) {
+    return {
+      errorType: ForwardErrorType.PROTECTED_CONTENT,
+      message: 'The source message or chat has content protection enabled and cannot be forwarded.',
+      isTransient: false,
+    };
+  }
+
+  // 8. Message Not Found (Permanent)
+  if (
+    lower.includes('message to forward not found') ||
+    lower.includes('message not found') ||
+    lower.includes('message can’t be found')
+  ) {
+    return {
+      errorType: ForwardErrorType.MESSAGE_NOT_FOUND,
+      message: 'The source message could not be found or has been deleted.',
+      isTransient: false,
+    };
+  }
+
+  // 9. Unknown Error
   return {
     errorType: ForwardErrorType.UNKNOWN_ERROR,
     message: errMsg,
+    isTransient: false,
   };
 }
 
@@ -155,11 +231,11 @@ export class ForwardingService {
       };
     } catch (err) {
       const sanitized = sanitizeError(err, token);
-      const { errorType, message, retryAfterSeconds } = classifyTelegramError(err);
+      const { errorType, message, isTransient, retryAfterSeconds } = classifyTelegramError(err);
 
       console.error(
         `[ForwardingService Error] Failed to forward message #${srcMsgId} from ${srcChatId} to ${destChatId}: ` +
-        `[${errorType}] ${message} (Detail: ${sanitized})`
+        `[${errorType}] ${message} (Transient: ${isTransient}, Detail: ${sanitized})`
       );
 
       return {
@@ -167,6 +243,7 @@ export class ForwardingService {
         errorType,
         errorMessage: message,
         rawError: sanitized,
+        isTransient,
         retryAfterSeconds,
       };
     }
@@ -207,11 +284,11 @@ export class ForwardingService {
       };
     } catch (err) {
       const sanitized = sanitizeError(err, token);
-      const { errorType, message, retryAfterSeconds } = classifyTelegramError(err);
+      const { errorType, message, isTransient, retryAfterSeconds } = classifyTelegramError(err);
 
       console.error(
         `[ForwardingService Error] Failed to forward album [${sortedMsgIds.join(', ')}] from ${srcChatId} to ${destChatId}: ` +
-        `[${errorType}] ${message} (Detail: ${sanitized})`
+        `[${errorType}] ${message} (Transient: ${isTransient}, Detail: ${sanitized})`
       );
 
       return {
@@ -219,6 +296,7 @@ export class ForwardingService {
         errorType,
         errorMessage: message,
         rawError: sanitized,
+        isTransient,
         retryAfterSeconds,
       };
     }

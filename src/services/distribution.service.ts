@@ -5,7 +5,7 @@ import { forwardingService, ForwardingService, ForwardErrorType } from './forwar
 import { albumService, AlbumService } from './album.service';
 import { deliveryService, DeliveryService } from './delivery.service';
 import { detectSourceAnnouncement } from '../bot/detector';
-import { sanitizeError } from '../bot/bot';
+import { sanitizeError } from '../utils/sanitize';
 
 export interface DestinationDeliveryResult {
   destinationId: string;
@@ -60,7 +60,7 @@ export class DistributionService {
       this.interDestinationDelayMs = interDestinationDelayMs !== undefined
         ? interDestinationDelayMs
         : (process.env.NODE_ENV === 'test' ? 0 : 50);
-      this.maxBackoffMs = maxBackoffMs;
+      this.maxBackoffMs = process.env.NODE_ENV === 'test' ? 10 : maxBackoffMs;
     }
 
     // Register this distribution service's album handler with the album service
@@ -232,12 +232,14 @@ export class DistributionService {
             forwardedMessageIds: forwardResult.forwardedMessageIds,
           });
         } else {
-          // Step C2: Mark FAILED in database
+          // Step C2: Mark FAILED or RETRYING in database
           await this.delivService.markFailure(
             sourceGroup.chatId,
             messageId,
             destination.id,
-            forwardResult.errorMessage || 'Unknown forward failure'
+            forwardResult.errorMessage || 'Unknown forward failure',
+            forwardResult.isTransient,
+            forwardResult.retryAfterSeconds
           );
 
           summary.failedCount++;
@@ -420,12 +422,14 @@ export class DistributionService {
             forwardedMessageIds: forwardResult.forwardedMessageIds,
           });
         } else {
-          // Step C2: Mark FAILED for all items in database
+          // Step C2: Mark FAILED or RETRYING for all items in database
           await this.delivService.markAlbumFailure(
             sourceGroup.chatId,
             sortedIds,
             destination.id,
-            forwardResult.errorMessage || 'Unknown forwardMessages failure'
+            forwardResult.errorMessage || 'Unknown forwardMessages failure',
+            forwardResult.isTransient,
+            forwardResult.retryAfterSeconds
           );
 
           summary.failedCount++;

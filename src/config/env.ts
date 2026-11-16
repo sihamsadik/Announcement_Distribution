@@ -25,6 +25,27 @@ export function getAdminUserIds(): number[] {
   return parseAdminUserIds(process.env.ADMIN_USER_IDS);
 }
 
+export interface RetryConfig {
+  maxRetryCount: number;
+  initialRetryDelaySeconds: number;
+  maxRetryDelaySeconds: number;
+  retryPollIntervalMs: number;
+}
+
+export function loadRetryConfig(): RetryConfig {
+  const maxRetries = parseInt(process.env.MAX_RETRY_COUNT || '3', 10);
+  const initialDelay = parseInt(process.env.INITIAL_RETRY_DELAY_SECONDS || '5', 10);
+  const maxDelay = parseInt(process.env.MAX_RETRY_DELAY_SECONDS || '300', 10);
+  const pollInterval = parseInt(process.env.RETRY_POLL_INTERVAL_MS || '10000', 10);
+
+  return {
+    maxRetryCount: isNaN(maxRetries) || maxRetries < 0 ? 3 : maxRetries,
+    initialRetryDelaySeconds: isNaN(initialDelay) || initialDelay <= 0 ? 5 : initialDelay,
+    maxRetryDelaySeconds: isNaN(maxDelay) || maxDelay <= 0 ? 300 : maxDelay,
+    retryPollIntervalMs: isNaN(pollInterval) || pollInterval <= 0 ? 10000 : pollInterval,
+  };
+}
+
 export function loadConfig(): AppConfig {
   const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
 

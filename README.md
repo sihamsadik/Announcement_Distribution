@@ -13,6 +13,10 @@ A Telegram bot service built with **Node.js**, **TypeScript**, **Telegraf**, and
 - [Telegram Bot Group Permissions & Privacy Mode](#telegram-bot-group-permissions--privacy-mode)
 - [Installation and Building](#installation-and-building)
 - [Database Schema & Prisma 7](#database-schema--prisma-7)
+- [Destination Group Management](#destination-group-management)
+- [Message Forwarding & Distribution Engine](#message-forwarding--distribution-engine)
+- [Persistent Delivery Tracking & Idempotency](#persistent-delivery-tracking--idempotency)
+- [Retry Mechanisms & Failure Recovery (Day 2 - Task 5)](#retry-mechanisms--failure-recovery-day-2---task-5)
 - [Running the Application](#running-the-application)
 - [Verification and Testing](#verification-and-testing)
 - [Security Considerations](#security-considerations)
@@ -355,6 +359,52 @@ Destination groups represent the student project groups that receive announcemen
 2. **Execution Context**: `/register_destination` must be run directly inside the student Telegram group (private chat attempts are rejected).
 3. **Soft Deactivation**: `/remove_destination` deactivates the destination (`isActive = false`) rather than deleting it. This preserves delivery history and audit logs while stopping future forwards until reactivated via `/activate_destination`.
 4. **Permissions**: The bot must be added to each destination group and granted permission to send messages.
+
+---
+
+## Message Forwarding & Distribution Engine
+
+The system forwards announcements natively using the Telegram Bot API (`forwardMessage` / `forwardMessages`):
+- **Content Types**: Supports plain text, photos with captions, PDFs and documents, videos, audio, voice notes, video notes, stickers, and animations without re-uploading files.
+- **Media Albums**: Multi-photo/document albums sharing a `media_group_id` are debounced (300ms window) and forwarded atomically via `telegram.forwardMessages` where supported, maintaining visual integrity.
+- **Inter-Destination Delay**: Enforces a gentle configurable delay (50ms) between destination sends to comply with Telegram rate limit guidance.
+
+---
+
+## Persistent Delivery Tracking & Idempotency
+
+Every forwarding attempt is recorded in the `ForwardingLog` table:
+- **Composite Key Idempotency**: Unique constraint `@@unique([sourceChatId, sourceMessageId, destinationGroupId])` guarantees that no message is ever delivered multiple times to the same destination group.
+- **In-Flight Claiming**: Before forwarding, the delivery service claims an in-flight delivery by inserting or locking a `PENDING` log. If another worker or re-delivered webhook attempts delivery, it is detected and skipped.
+- **Stale Claim Recovery**: Stale `PENDING` records (>60s) from interrupted processes are automatically recovered.
+
+---
+
+## Retry Mechanisms & Failure Recovery (Day 2 - Task 5)
+
+The system features an autonomous, database-backed retry mechanism for handling temporary Telegram API and network disruptions:
+
+### 1. Error Classification
+Forwarding errors are automatically inspected and categorized:
+- **Transient Errors**: Network timeouts (`ETIMEDOUT`, `ECONNRESET`), socket hang-ups, HTTP 5xx Telegram server errors (`500`, `502`, `503`, `504`), and HTTP 429 rate limits (`Too Many Requests: retry after X`). These trigger automated retries.
+- **Permanent Errors**: Bot removed from destination (`BOT_NOT_MEMBER`), write permissions denied (`CHAT_WRITE_FORBIDDEN`), invalid chat ID (`INVALID_CHAT_ID`), protected chat content (`PROTECTED_CONTENT`), and deleted messages (`MESSAGE_NOT_FOUND`). These immediately transition to `FAILED` without retrying.
+
+### 2. Exponential Backoff & Rate Limit Handling
+- **Formula**: `delayMs = Math.min(Math.max(initialDelay * 2^retryCount, retryAfterSeconds), maxDelay) * 1000`
+- **Rate Limits**: If Telegram returns a `retry_after` parameter, the retry delay respects Telegram's exact requested waiting period.
+- **Configuration Parameters** (via `.env`):
+  - `MAX_RETRY_COUNT`: Maximum retry attempts before marking terminal `FAILED` (default: `3`).
+  - `INITIAL_RETRY_DELAY_SECONDS`: Base backoff interval (default: `5`).
+  - `MAX_RETRY_DELAY_SECONDS`: Maximum backoff interval cap (default: `300`).
+  - `RETRY_POLL_INTERVAL_MS`: Periodic background retry polling interval (default: `10000`).
+
+### 3. Concurrency Safety & Optimistic Locking
+- Retries are stored persistently in PostgreSQL with status `RETRYING` and a indexed `nextRetryAt` timestamp (`@@index([status, nextRetryAt])`).
+- When polling for due retries (`nextRetryAt <= NOW()`), workers claim records atomically using PostgreSQL optimistic locking (`UPDATE "ForwardingLog" SET "updatedAt" = NOW() WHERE "id" = :id AND "updatedAt" = :expectedUpdatedAt AND "status" = 'RETRYING'`).
+- This guarantees that multiple background workers or clustering cannot execute duplicate retries.
+
+### 4. Process Restart Recovery
+- When the bot initializes, `recoverStalePendingDeliveries()` checks the database for any `PENDING` delivery records left hanging (e.g. from an ungraceful crash or container restart >60s ago) and transitions them to `RETRYING` with `nextRetryAt = NOW()`, ensuring zero message loss.
 
 ---
 
