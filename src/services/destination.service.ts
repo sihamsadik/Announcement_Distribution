@@ -155,6 +155,32 @@ export class DestinationService {
   }
 
   /**
+   * Retrieves only active destination groups for a specific source group.
+   */
+  async getActiveDestinations(sourceGroupId: string): Promise<DestinationGroup[]> {
+    const trimmedId = sourceGroupId?.trim();
+    if (!trimmedId) {
+      return [];
+    }
+
+    try {
+      return await prisma.destinationGroup.findMany({
+        where: {
+          sourceGroupId: trimmedId,
+          isActive: true,
+        },
+        orderBy: {
+          createdAt: 'asc',
+        },
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[DestinationService Error] Failed to get active destinations: ${errorMsg}`);
+      return [];
+    }
+  }
+
+  /**
    * Finds a destination group by primary key ID.
    */
   async getDestinationById(id: string): Promise<DestinationWithSource | null> {

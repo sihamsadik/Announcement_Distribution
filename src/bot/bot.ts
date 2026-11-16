@@ -5,6 +5,7 @@ import { sourceService } from '../services/source.service';
 import { detectSourceAnnouncement } from './detector';
 import { registerDestinationCommands } from './destination.commands';
 import { registerForwardingCommands } from './forwarding.commands';
+import { distributionService } from '../services/distribution.service';
 
 /**
  * Strips any occurrence of the bot token from error strings or logs.
@@ -172,17 +173,12 @@ export function setupBotHandlers(bot: Telegraf, token?: string): void {
   // Register message forwarding test command (/test_forward)
   registerForwardingCommands(bot, token);
 
-  // Listener for general messages: detects announcements from registered source topics
+  // Listener for general messages: detects announcements from registered source topics and distributes them
   bot.on('message', async (ctx, next) => {
     try {
-      // Skip if message is a command
-      if (ctx.message && 'text' in ctx.message && ctx.message.text.startsWith('/')) {
-        return await next();
-      }
-
-      await detectSourceAnnouncement(ctx);
+      await distributionService.processIncomingMessage(ctx, token);
     } catch (err) {
-      console.error('[Telegram Bot] Error during announcement detection:', sanitizeError(err, token));
+      console.error('[Telegram Bot] Error during announcement distribution:', sanitizeError(err, token));
     }
 
     return await next();

@@ -224,6 +224,23 @@ The system can monitor specific Telegram forum topics within course supergroups 
 
 ---
 
+## Announcement Distribution Service
+
+The distribution service ([src/services/distribution.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/distribution.service.ts)) connects source-topic detection, active destination retrieval, and message forwarding into an end-to-end automated pipeline:
+
+1. **Automatic Detection**: When an announcement is published in a registered source forum topic, the system automatically detects the source group and topic thread ID.
+2. **Active Group Filtering**: Only active destinations (`isActive: true`) associated with that specific `sourceGroupId` receive the announcement. Inactive destinations and destinations associated with other source topics are excluded.
+3. **Loop & Command Protection**:
+   - Messages sent by any bot (`message.from.is_bot = true`) are ignored to prevent feedback loops.
+   - The bot's own administrative updates are ignored.
+   - Bot commands (starting with `/`) are ignored and not forwarded to destination groups.
+4. **Resilience & Partial Failure Handling**:
+   - Messages are forwarded sequentially to all active destinations.
+   - Individual forwarding failures (e.g. `BOT_NOT_MEMBER`, `PERMISSION_DENIED`, `RATE_LIMITED`) do not stop delivery to the remaining destinations.
+   - An in-memory structured delivery summary (`DistributionSummary`) records the total destinations, successful count, failed count, and individual destination outcomes.
+
+---
+
 ## Message Forwarding Engine
 
 The message forwarding engine ([src/services/forwarding.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/forwarding.service.ts)) enables native Telegram message forwarding:
