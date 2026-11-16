@@ -3,6 +3,7 @@ import { BOT_MESSAGES } from './messages';
 import { isAuthorizedAdmin } from './auth';
 import { sourceService } from '../services/source.service';
 import { detectSourceAnnouncement } from './detector';
+import { registerDestinationCommands } from './destination.commands';
 
 /**
  * Strips any occurrence of the bot token from error strings or logs.
@@ -163,6 +164,9 @@ export function setupBotHandlers(bot: Telegraf, token?: string): void {
       await ctx.reply('❌ An error occurred while fetching the sources list.');
     }
   });
+
+  // Register destination management commands (/register_destination, /list_destinations, etc.)
+  registerDestinationCommands(bot, token);
 
   // Listener for general messages: detects announcements from registered source topics
   bot.on('message', async (ctx, next) => {

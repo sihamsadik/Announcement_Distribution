@@ -180,19 +180,49 @@ The system can monitor specific Telegram forum topics within course supergroups 
 | Command | Description | Permissions |
 | :--- | :--- | :--- |
 | `/start` | Introduces the bot and welcome message | Public |
-| `/help` | Explains bot features and registration commands | Public |
+| `/help` | Explains bot features and commands | Public |
 | `/register_source [topicId] <name>` | Registers the current group topic as an announcement source | Admins Only |
-| `/list_sources` | Displays all registered source groups and topics | Admins Only |
+| `/list_sources` | Displays all registered source groups and topics with their IDs | Admins Only |
+| `/register_destination <source_id> <group_name>` | Registers the current student group as a destination linked to a source | Admins Only |
+| `/list_destinations [source_id]` | Displays destinations (optionally filtered by source ID) | Admins Only |
+| `/remove_destination <destination_id>` | Deactivates a destination group (`isActive: false`, preserves history) | Admins Only |
+| `/activate_destination <destination_id>` | Reactivates a previously deactivated destination group | Admins Only |
 
 #### Usage Examples:
-- **Inside a forum topic**:
+
+- **Register a Source Topic**:
   ```text
   /register_source Final Project Announcements
   ```
-- **With explicit topic ID** (recommended if outside topic or in general chat):
+  *(or `/register_source 42 Final Project Announcements` with explicit topic ID)*
+
+- **Register a Destination Group**:
+  Run directly inside the student Telegram group:
   ```text
-  /register_source 42 Final Project Announcements
+  /register_destination <source_id> Final Project Team 1
   ```
+
+- **List Destinations**:
+  ```text
+  /list_destinations
+  /list_destinations <source_id>
+  ```
+
+- **Deactivate / Reactivate Destination**:
+  ```text
+  /remove_destination <destination_id>
+  /activate_destination <destination_id>
+  ```
+
+---
+
+## Destination Group Management
+
+Destination groups represent the student project groups that receive announcements:
+1. **One-to-Many Association**: Each destination group links to exactly one source topic via `sourceGroupId` in `DestinationGroup`. One source topic can distribute to dozens of destination groups.
+2. **Execution Context**: `/register_destination` must be run directly inside the student Telegram group (private chat attempts are rejected).
+3. **Soft Deactivation**: `/remove_destination` deactivates the destination (`isActive = false`) rather than deleting it. This preserves delivery history and audit logs while stopping future forwards until reactivated via `/activate_destination`.
+4. **Permissions**: The bot must be added to each destination group and granted permission to send messages.
 
 ---
 
