@@ -4,10 +4,10 @@ node_modules/
 # Local PostgreSQL Data
 .postgres_data/
 
-# Environment variables
+# Environment variables & secrets (never commit secrets)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Build output
 dist/

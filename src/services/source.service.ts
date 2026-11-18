@@ -1,5 +1,6 @@
 import { SourceGroup, DestinationGroup } from '@prisma/client';
 import { prisma } from '../db/prisma';
+import { isValidUuid, isValidTelegramChatId, isValidTelegramTopicId, validateResourceName } from '../utils/validators';
 
 export interface RegisterSourceInput {
   chatId: bigint | number | string;
@@ -46,12 +47,21 @@ export class SourceService {
    * If a source with the given chatId and topicId already exists, returns the existing record without duplicating.
    */
   async registerSource(input: RegisterSourceInput): Promise<RegisterSourceResult> {
-    const trimmedName = input.name?.trim();
-    if (!trimmedName) {
+    const nameValidation = validateResourceName(input.name, 'Source name');
+    if (!nameValidation.valid) {
       return {
         success: false,
         isNew: false,
-        message: 'Source name cannot be empty.',
+        message: nameValidation.error!,
+      };
+    }
+    const trimmedName = nameValidation.value!;
+
+    if (!isValidTelegramChatId(input.chatId) || !isValidTelegramTopicId(input.topicId)) {
+      return {
+        success: false,
+        isNew: false,
+        message: 'Invalid chat ID or topic ID provided.',
       };
     }
 
@@ -138,6 +148,10 @@ export class SourceService {
    */
   async findSource(chatId: bigint | number | string, topicId: bigint | number | string): Promise<SourceGroup | null> {
     try {
+      if (!isValidTelegramChatId(chatId) || !isValidTelegramTopicId(topicId)) {
+        return null;
+      }
+
       const bigChatId = BigInt(chatId);
       const bigTopicId = BigInt(topicId);
 
@@ -149,17 +163,38 @@ export class SourceService {
           },
         },
       });
-    } catch {
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[SourceService Error] Failed to find source: ${errorMsg}`);
       return null;
     }
   }
 
   /**
-   * Retrieves a source group by primary key ID, including associated destination groups.
+   * Finds a source group by its primary key ID.
    */
-  async getSourceById(id: string): Promise<SourceWithDestinations | null> {
+  async getSourceById(id: string): Promise<SourceGroup | null> {
     try {
+      if (!isValidUuid(id)) return null;
+
       return await prisma.sourceGroup.findUnique({
+        where: { id: id.trim() },
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[SourceService Error] Failed to get source by ID: ${errorMsg}`);
+      return null;
+    }
+  }
+
+  /**
+   * Retrieves full details for a source, including associated destination groups and delivery metrics.
+   */
+  async getSourceDetails(id: string): Promise<SourceDetails | null> {
+    try {
+      if (!isValidUuid(id)) return null;
+
+      const source = await prisma.sourceGroup.findUnique({
         where: { id: id.trim() },
         include: {
           destinationGroups: {
@@ -167,45 +202,72 @@ export class SourceService {
           },
         },
       });
+
+      if (!source) {
+        return null;
+      }
+
+      const totalDestinations = source.destinationGroups.length;
+      const activeDestinations = source.destinationGroups.filter((d) => d.isActive).length;
+      const inactiveDestinations = totalDestinations - activeDestinations;
+
+      // Query delivery logs associated with this source
+      const totalDeliveries = await prisma.forwardingLog.count({
+        where: {
+          destinationGroup: {
+            sourceGroupId: source.id,
+          },
+        },
+      });
+
+      const successfulDeliveries = await prisma.forwardingLog.count({
+        where: {
+          destinationGroup: {
+            sourceGroupId: source.id,
+          },
+          status: 'SUCCESS',
+        },
+      });
+
+      const failedDeliveries = await prisma.forwardingLog.count({
+        where: {
+          destinationGroup: {
+            sourceGroupId: source.id,
+          },
+          status: {
+            in: ['FAILED', 'RETRYING'],
+          },
+        },
+      });
+
+      return {
+        source,
+        destinations: source.destinationGroups,
+        totalDestinations,
+        activeDestinations,
+        inactiveDestinations,
+        totalDeliveries,
+        successfulDeliveries,
+        failedDeliveries,
+      };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[SourceService Error] Failed to find source by ID: ${errorMsg}`);
+      console.error(`[SourceService Error] Failed to get source details: ${errorMsg}`);
       return null;
     }
   }
 
   /**
-   * Retrieves all registered sources with associated destination group counts.
-   */
-  async listSources(): Promise<SourceWithDestinations[]> {
-    try {
-      return await prisma.sourceGroup.findMany({
-        include: {
-          destinationGroups: {
-            orderBy: { createdAt: 'asc' },
-          },
-        },
-        orderBy: {
-          createdAt: 'desc',
-        },
-      });
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[SourceService Error] Failed to list sources: ${errorMsg}`);
-      return [];
-    }
-  }
-
-  /**
-   * Updates the active status of a source topic.
-   * Deactivating (isActive: false) prevents future forwards while retaining full delivery history.
+   * Toggles the active status of a source group.
+   * Deactivating (isActive: false) prevents the bot from forwarding announcements from this topic,
+   * while completely preserving all historical delivery records and destination links.
    */
   async setSourceStatus(id: string, isActive: boolean): Promise<UpdateSourceStatusResult> {
     const trimmedId = id?.trim();
-    if (!trimmedId) {
+    if (!trimmedId || !isValidUuid(trimmedId)) {
       return {
         success: false,
-        message: 'Source ID cannot be empty.',
+        message: 'Invalid Source ID format. Expected a valid UUID.',
       };
     }
 
@@ -217,15 +279,7 @@ export class SourceService {
       if (!existing) {
         return {
           success: false,
-          message: `Source topic with ID "${trimmedId}" was not found. Use /list_sources to view available sources.`,
-        };
-      }
-
-      if (existing.isActive === isActive) {
-        return {
-          success: true,
-          message: `Source topic "${existing.name}" is already ${isActive ? 'active' : 'inactive'}.`,
-          source: existing,
+          message: `Source topic with ID "${trimmedId}" was not found.`,
         };
       }
 
@@ -234,12 +288,12 @@ export class SourceService {
         data: { isActive },
       });
 
-      const action = isActive ? 'reactivated' : 'deactivated';
-      console.log(`[SourceService] Source topic "${updated.name}" (${updated.id}) ${action}.`);
+      const actionText = isActive ? 'reactivated' : 'deactivated';
+      console.log(`[SourceService] Source topic "${updated.name}" (${updated.id}) ${actionText}.`);
 
       return {
         success: true,
-        message: `Source topic "${updated.name}" has been successfully ${action}.`,
+        message: `Source topic "${updated.name}" has been ${actionText}.`,
         source: updated,
       };
     } catch (err) {
@@ -253,34 +307,34 @@ export class SourceService {
   }
 
   /**
-   * Safe source deletion:
-   * Prevents hard deletion if historical delivery logs exist to preserve audit history.
-   * Admins are instructed to deactivate instead.
+   * Attempts to permanently delete a source group.
+   * CRITICAL DATA INTEGRITY SAFEGUARD:
+   * Rejects deletion if any historical delivery records exist for this source,
+   * instructing administrators to use soft-deactivation instead.
    */
   async deleteSource(id: string): Promise<DeleteSourceResult> {
     const trimmedId = id?.trim();
-    if (!trimmedId) {
+    if (!trimmedId || !isValidUuid(trimmedId)) {
       return {
         success: false,
-        message: 'Source ID cannot be empty.',
+        message: 'Invalid Source ID format. Expected a valid UUID.',
       };
     }
 
     try {
       const existing = await prisma.sourceGroup.findUnique({
         where: { id: trimmedId },
-        include: { destinationGroups: true },
       });
 
       if (!existing) {
         return {
           success: false,
-          message: `Source topic with ID "${trimmedId}" was not found.`,
+          message: `Source with ID "${trimmedId}" was not found.`,
         };
       }
 
-      // Check if any forwarding logs are associated with destinations of this source
-      const logCount = await prisma.forwardingLog.count({
+      // Check if forwarding logs exist across any linked destinations
+      const logsCount = await prisma.forwardingLog.count({
         where: {
           destinationGroup: {
             sourceGroupId: trimmedId,
@@ -288,24 +342,24 @@ export class SourceService {
         },
       });
 
-      if (logCount > 0) {
+      if (logsCount > 0) {
         return {
           success: false,
           message:
-            `Cannot delete source "${existing.name}": ${logCount} historical forwarding log(s) exist. ` +
-            `To safely preserve audit logs while stopping future distribution, deactivate it with /remove_source ${trimmedId}`,
+            `Cannot delete source "${existing.name}": ${logsCount} historical forwarding log(s) exist. ` +
+            `To protect audit history, please use soft deactivation (/remove_source ${trimmedId}) instead.`,
         };
       }
 
-      // Safe to delete because no delivery history exists
       await prisma.sourceGroup.delete({
         where: { id: trimmedId },
       });
 
-      console.log(`[SourceService] Source "${existing.name}" (${trimmedId}) deleted safely (0 forwarding logs existed).`);
+      console.log(`[SourceService] Permanently deleted unused source "${existing.name}" (${trimmedId}).`);
+
       return {
         success: true,
-        message: `Source topic "${existing.name}" has been permanently deleted.`,
+        message: `Source "${existing.name}" was permanently deleted.`,
       };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -318,57 +372,22 @@ export class SourceService {
   }
 
   /**
-   * Retrieves comprehensive metadata, destination list, and delivery statistics for a source.
+   * Retrieves all registered source groups, ordered by creation date descending.
    */
-  async getSourceDetails(id: string): Promise<SourceDetails | null> {
-    const trimmedId = id?.trim();
-    if (!trimmedId) {
-      return null;
-    }
-
+  async listSources(): Promise<SourceWithDestinations[]> {
     try {
-      const source = await prisma.sourceGroup.findUnique({
-        where: { id: trimmedId },
+      return await prisma.sourceGroup.findMany({
+        orderBy: {
+          createdAt: 'desc',
+        },
         include: {
-          destinationGroups: {
-            orderBy: { createdAt: 'asc' },
-          },
+          destinationGroups: true,
         },
       });
-
-      if (!source) {
-        return null;
-      }
-
-      const activeCount = source.destinationGroups.filter((d) => d.isActive).length;
-      const inactiveCount = source.destinationGroups.length - activeCount;
-
-      const [totalDeliveries, successfulDeliveries, failedDeliveries] = await Promise.all([
-        prisma.forwardingLog.count({
-          where: { destinationGroup: { sourceGroupId: trimmedId } },
-        }),
-        prisma.forwardingLog.count({
-          where: { destinationGroup: { sourceGroupId: trimmedId }, status: 'SUCCESS' },
-        }),
-        prisma.forwardingLog.count({
-          where: { destinationGroup: { sourceGroupId: trimmedId }, status: 'FAILED' },
-        }),
-      ]);
-
-      return {
-        source,
-        destinations: source.destinationGroups,
-        totalDestinations: source.destinationGroups.length,
-        activeDestinations: activeCount,
-        inactiveDestinations: inactiveCount,
-        totalDeliveries,
-        successfulDeliveries,
-        failedDeliveries,
-      };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[SourceService Error] Failed to get source details: ${errorMsg}`);
-      return null;
+      console.error(`[SourceService Error] Failed to list sources: ${errorMsg}`);
+      return [];
     }
   }
 }

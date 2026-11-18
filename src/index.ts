@@ -23,6 +23,23 @@ async function main(): Promise<void> {
       healthPort: config.healthPort,
     });
 
+    // Setup global unhandled error handlers
+    process.on('unhandledRejection', (reason) => {
+      const safeReason = logger.sanitize(reason instanceof Error ? reason.message : String(reason));
+      logger.error('Unhandled Promise Rejection detected', {
+        event: 'app.unhandled_rejection',
+        error: safeReason,
+      });
+    });
+
+    process.on('uncaughtException', (err) => {
+      const safeErr = logger.sanitize(err.message);
+      logger.error('Uncaught Exception detected', {
+        event: 'app.uncaught_exception',
+        error: safeErr,
+      });
+    });
+
     // 1. Verify Database Connection
     logger.info('Verifying PostgreSQL connection via Prisma 7...', { event: 'db.connecting' });
     const dbConnected = await checkDatabaseConnection();

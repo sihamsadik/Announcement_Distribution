@@ -493,6 +493,7 @@ npm test
 
 | Test Suite | Purpose | Tests |
 | :--- | :--- | :---: |
+| `tests/day4_security_validation.test.ts` | Security hardening, input validation, update eligibility, and authorization review | 25 |
 | `tests/day3_stats_logging_health.test.ts`| Distribution statistics, structured logging, sanitization, and HTTP health checks | 20 |
 | `tests/day3_admin_monitoring.test.ts` | Admin auth security, source/dest lifecycle, deactivation, and in-chat monitoring | 25 |
 | `tests/integration_day2.test.ts` | Complete end-to-end integration and reliability verification | 18 |
@@ -500,13 +501,13 @@ npm test
 | `tests/delivery_tracking.test.ts` | Database idempotency, PENDING claims, and crash recovery | 11 |
 | `tests/retry.test.ts` | Exponential backoff, optimistic locking, and background retries | 19 |
 | `tests/media_album.test.ts` | Debouncing, album collection ceiling, and media types | 27 |
-| `tests/forwarding.test.ts` | Native forwarding, error classification, and token sanitization | 21 |
+| `tests/forwarding.test.ts` | Native forwarding, error classification, and token sanitization | 22 |
 | `tests/destination.test.ts` | Destination group management, soft-deactivation, and commands | 14 |
-| `tests/source.test.ts` | Source registration and forum topic detection | 10 |
+| `tests/source.test.ts` | Source registration and forum topic detection | 20 |
 | `tests/bot.test.ts` | Telegraf bot setup and error handling | 7 |
 | `tests/db.test.ts` | Prisma 7 PostgreSQL integration and cascades | 2 |
 | `tests/config.test.ts` | Environment configuration and token validation | 5 |
-| **Total** | | **207 passing** |
+| **Total** | | **232 passing** |
 
 ### 2. Manual Live Telegram Testing Procedure
 To verify live in Telegram:
@@ -535,9 +536,32 @@ To verify live in Telegram:
 
 ---
 
-## 14. Security Considerations
+## 14. Security Hardening, Input Validation & Authorization Review
 
-- **Zero Hardcoded Secrets**: All tokens and database credentials are strictly loaded via `.env`.
-- **Token Sanitization**: `sanitizeError` strips bot tokens from all console logs and database error messages.
-- **Admin Authorization**: Modifying sources or destinations requires explicit admin rights (`ADMIN_USER_IDS` or chat administrator privileges).
-- **Bot Loop Protection**: Messages from other bots and commands are excluded from distribution.
+### 1. Secret & Environment Variable Protection
+- **No Hardcoded Credentials**: Telegram bot tokens, database connection strings, and administrative IDs are read exclusively from environment variables or `.env`.
+- **Git Safety**: `.gitignore` strictly excludes `.env` and `.env.*` while keeping `.env.example`.
+- **Automated Startup Validation**: `validateStartupConfig` ensures valid bot token format (`<bot_id>:<secret>`), valid PostgreSQL connection string, and valid port bounds (1–65535) before booting services.
+- **Secret Redaction**: `logger.sanitize` and `sanitizeError` proactively strip bot tokens and connection passwords from all stdout logs, stack traces, and database error messages.
+- **Process Crash Protection**: Global `unhandledRejection` and `uncaughtException` handlers sanitize error output and shut down cleanly on fatal errors.
+
+### 2. Input Validation & Service Boundaries
+- **Centralized Validation Layer (`src/utils/validators.ts`)**:
+  - `isValidUuid`: Enforces RFC 4122 UUID v4 formatting on all internal and command-line identifiers.
+  - `isValidTelegramChatId`: Ensures 64-bit signed Telegram chat IDs are valid non-zero integers.
+  - `isValidTelegramTopicId`: Ensures forum thread IDs are strictly positive integers.
+  - `validateResourceName`: Sanitizes names, enforces a 100-character upper bound, rejects empty strings, and rejects unsupported ASCII control characters (`[\x00-\x1F\x7F]`) and line breaks.
+  - `validateLimit`: Validates and clamps query pagination limits within strict bounds (min 1, max 50).
+  - `isValidTimeframe`: Validates time window queries against an allowlist (`24h`, `7d`, `30d`, `all`).
+- **Telegram Update Filtering (`isEligibleMessage`)**:
+  - Drops updates sent by bots (`from.is_bot === true`) or from the bot itself to prevent infinite forwarding loops.
+  - Filters out bot command invocations (`/command ...`).
+  - Filters out Telegram service notifications (pinned messages, member joins/leaves, title/photo updates, forum topic creation/editing/closure/reopening).
+  - Rejects protected content messages (`has_protected_content === true`) that Telegram forbids from being forwarded.
+
+### 3. Authorization Review & Fail-Closed Access Control
+- **Fail-Closed Architecture**: Missing context, unauthenticated users (`userId <= 0` or missing `from`), or Telegram API network failures fail closed and deny access.
+- **Context-Aware Chat Segregation**:
+  - **Private Chats**: Ordinary members and group admins cannot run administrative commands in direct messages with the bot. Private chats are strictly restricted to IDs explicitly declared in `ADMIN_USER_IDS`.
+  - **Group Chats**: Commands require the user to be either in `ADMIN_USER_IDS` or a verified `creator` or `administrator` in that Telegram group (queried via `getChatAdministrators`). Ordinary members are strictly denied.
+- **Security Audit Logging**: Every unauthorized action attempt triggers a structured audit log (`event: "security.unauthorized_access"`) recording the user ID, chat ID, chat type, and attempted action.

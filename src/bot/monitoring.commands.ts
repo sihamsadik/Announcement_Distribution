@@ -2,6 +2,7 @@ import { Telegraf } from 'telegraf';
 import { isAuthorizedAdmin, denyUnauthorizedAccess } from './auth';
 import { monitoringService, TimeframeOption } from '../services/monitoring.service';
 import { logger } from '../utils/logger';
+import { isValidUuid, isValidTimeframe, validateLimit } from '../utils/validators';
 
 /**
  * Registers delivery monitoring commands with the Telegraf bot.
@@ -23,14 +24,22 @@ export function registerMonitoringCommands(bot: Telegraf, token?: string): void 
       let sourceId: string | undefined;
       let timeframe: TimeframeOption | undefined;
 
-      const validTimeframes = ['24h', '7d', '30d', 'all'];
-
       for (const part of parts) {
         const lower = part.toLowerCase();
-        if (validTimeframes.includes(lower)) {
+        if (isValidTimeframe(lower)) {
           timeframe = lower as TimeframeOption;
-        } else if (part.length > 5) {
+        } else if (isValidUuid(part)) {
           sourceId = part;
+        } else {
+          await ctx.reply(
+            `⚠️ Unrecognized argument: \`${part}\`.\n\n` +
+            `**Usage**:\n` +
+            `• \`/delivery_stats\` (All time, all sources)\n` +
+            `• \`/delivery_stats 24h\` (or \`7d\`, \`30d\`)\n` +
+            `• \`/delivery_stats <source_uuid>\`\n` +
+            `• \`/delivery_stats <source_uuid> 24h\``
+          );
+          return;
         }
       }
 
@@ -73,11 +82,17 @@ export function registerMonitoringCommands(bot: Telegraf, token?: string): void 
 
       for (const p of parts) {
         if (/^\d+$/.test(p)) {
-          limit = parseInt(p, 10);
-        } else if (['24h', '7d', '30d'].includes(p.toLowerCase())) {
+          limit = validateLimit(p, 1, 50, 10);
+        } else if (isValidTimeframe(p)) {
           since = monitoringService.parseTimeframeDate(p);
-        } else if (p.length > 10) {
+        } else if (isValidUuid(p)) {
           sourceId = p;
+        } else {
+          await ctx.reply(
+            `⚠️ Unrecognized argument: \`${p}\`.\n\n` +
+            `**Usage**: \`/recent_deliveries [limit (1-50)] [source_uuid] [24h|7d|30d]\``
+          );
+          return;
         }
       }
 
@@ -114,11 +129,17 @@ export function registerMonitoringCommands(bot: Telegraf, token?: string): void 
 
       for (const p of parts) {
         if (/^\d+$/.test(p)) {
-          limit = parseInt(p, 10);
-        } else if (['24h', '7d', '30d'].includes(p.toLowerCase())) {
+          limit = validateLimit(p, 1, 50, 10);
+        } else if (isValidTimeframe(p)) {
           since = monitoringService.parseTimeframeDate(p);
-        } else if (p.length > 10) {
+        } else if (isValidUuid(p)) {
           sourceId = p;
+        } else {
+          await ctx.reply(
+            `⚠️ Unrecognized argument: \`${p}\`.\n\n` +
+            `**Usage**: \`/failed_deliveries [limit (1-50)] [source_uuid] [24h|7d|30d]\``
+          );
+          return;
         }
       }
 
@@ -154,6 +175,11 @@ export function registerMonitoringCommands(bot: Telegraf, token?: string): void 
           'ℹ️ **Usage**: `/delivery_details <log_id>`\n\n' +
           'Tip: Copy a log ID from `/recent_deliveries` or `/failed_deliveries`.'
         );
+        return;
+      }
+
+      if (!isValidUuid(logId)) {
+        await ctx.reply('❌ Invalid Delivery Log ID format. Expected a valid UUID.\n\nTip: Copy an ID from `/recent_deliveries` or `/failed_deliveries`.');
         return;
       }
 

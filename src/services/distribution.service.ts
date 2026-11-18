@@ -97,6 +97,31 @@ export class DistributionService {
       return { eligible: false, reason: 'Message is a bot command' };
     }
 
+    // 4. Do not forward Telegram service notifications
+    const m = message as any;
+    if (
+      m.pinned_message ||
+      m.new_chat_members ||
+      m.left_chat_member ||
+      m.new_chat_title ||
+      m.new_chat_photo ||
+      m.delete_chat_photo ||
+      m.group_chat_created ||
+      m.supergroup_chat_created ||
+      m.channel_chat_created ||
+      m.forum_topic_created ||
+      m.forum_topic_edited ||
+      m.forum_topic_closed ||
+      m.forum_topic_reopened
+    ) {
+      return { eligible: false, reason: 'Message is a Telegram service notification' };
+    }
+
+    // 5. Do not forward protected content messages that restrict forwarding
+    if (m.has_protected_content) {
+      return { eligible: false, reason: 'Message content is protected and cannot be forwarded' };
+    }
+
     return { eligible: true };
   }
 

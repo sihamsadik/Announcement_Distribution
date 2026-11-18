@@ -2,6 +2,7 @@ import { Telegraf } from 'telegraf';
 import { isAuthorizedAdmin, denyUnauthorizedAccess } from './auth';
 import { destinationService } from '../services/destination.service';
 import { sanitizeError } from '../utils/sanitize';
+import { isValidUuid, validateResourceName } from '../utils/validators';
 
 /**
  * Registers destination group management commands with the Telegraf bot.
@@ -38,9 +39,9 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
 
       const parts = rawArgs.split(/\s+/);
       const sourceId = parts[0]?.trim();
-      const groupName = parts.slice(1).join(' ').trim();
+      const rawGroupName = parts.slice(1).join(' ').trim();
 
-      if (!sourceId || !groupName) {
+      if (!sourceId || !rawGroupName) {
         await ctx.reply(
           '⚠️ Both Source ID and Destination Group Name are required.\n\n' +
           'Example:\n' +
@@ -49,13 +50,26 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
         return;
       }
 
+      if (!isValidUuid(sourceId)) {
+        await ctx.reply(
+          '❌ Invalid Source ID format. Expected a valid UUID (e.g. 12345678-1234-1234-1234-123456789abc).\n\nTip: Use `/list_sources` to copy a valid ID.'
+        );
+        return;
+      }
+
+      const nameValidation = validateResourceName(rawGroupName, 'Destination group name');
+      if (!nameValidation.valid) {
+        await ctx.reply(`⚠️ ${nameValidation.error}`);
+        return;
+      }
+
       console.log(
-        `[DestinationCommand] Attempting to register chat ${ctx.chat.id} as "${groupName}" under source "${sourceId}"`
+        `[DestinationCommand] Attempting to register chat ${ctx.chat.id} as "${nameValidation.value}" under source "${sourceId}"`
       );
 
       const result = await destinationService.registerDestination({
         chatId: ctx.chat.id,
-        groupName,
+        groupName: nameValidation.value!,
         sourceGroupId: sourceId,
       });
 
@@ -102,6 +116,11 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
       const text = 'text' in ctx.message ? ctx.message.text : '';
       const rawArgs = text.replace(/^\/list_destinations(@\w+)?\s*/, '').trim();
       const sourceId = rawArgs ? rawArgs.split(/\s+/)[0] : undefined;
+
+      if (sourceId && !isValidUuid(sourceId)) {
+        await ctx.reply('❌ Invalid Source ID format. Expected a valid UUID.\n\nTip: Use `/list_sources` to copy a valid ID.');
+        return;
+      }
 
       const destinations = await destinationService.listDestinations(sourceId);
 
@@ -165,6 +184,11 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
         return;
       }
 
+      if (!isValidUuid(destinationId)) {
+        await ctx.reply('❌ Invalid Destination ID format. Expected a valid UUID.\n\nTip: Use `/list_destinations` to find the ID.');
+        return;
+      }
+
       if (isForce) {
         // Attempt hard deletion (guarded against foreign key / log loss)
         const deleteResult = await destinationService.deleteDestination(destinationId);
@@ -215,6 +239,11 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
         await ctx.reply(
           'ℹ️ **Usage**: `/activate_destination <destination_id>`\n\nTip: Use `/list_destinations` to find the destination ID.'
         );
+        return;
+      }
+
+      if (!isValidUuid(destinationId)) {
+        await ctx.reply('❌ Invalid Destination ID format. Expected a valid UUID.\n\nTip: Use `/list_destinations` to find the ID.');
         return;
       }
 

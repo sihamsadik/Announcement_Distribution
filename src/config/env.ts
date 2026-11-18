@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { isValidTelegramBotToken, isValidDatabaseUrl } from '../utils/validators';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -73,9 +74,11 @@ export function loadConfig(): AppConfig {
       ? 'json'
       : 'text';
 
+  const databaseUrl = process.env.DATABASE_URL?.trim();
+
   return {
     telegramBotToken: token,
-    databaseUrl: process.env.DATABASE_URL?.trim(),
+    databaseUrl,
     adminUserIds: getAdminUserIds(),
     nodeEnv: process.env.NODE_ENV || 'development',
     healthPort,

@@ -2,6 +2,7 @@ import { Telegraf } from 'telegraf';
 import { isAuthorizedAdmin, denyUnauthorizedAccess } from './auth';
 import { sourceService } from '../services/source.service';
 import { sanitizeError } from '../utils/sanitize';
+import { isValidUuid, isValidTelegramTopicId, validateResourceName } from '../utils/validators';
 
 /**
  * Registers source management commands with the Telegraf bot.
@@ -37,22 +38,22 @@ export function registerSourceCommands(bot: Telegraf, token?: string): void {
       const contextTopicId = (ctx.message as any).message_thread_id;
       const parts = rawArgs.split(/\s+/);
       let targetTopicId: number | undefined;
-      let sourceName = '';
+      let rawSourceName = '';
 
       if (/^\d+$/.test(parts[0])) {
         // Explicit topic ID provided in command arguments
         targetTopicId = parseInt(parts[0], 10);
-        sourceName = parts.slice(1).join(' ').trim();
+        rawSourceName = parts.slice(1).join(' ').trim();
       } else if (contextTopicId !== undefined) {
         // Inherited topic ID from Telegram forum context
         targetTopicId = contextTopicId;
-        sourceName = rawArgs;
+        rawSourceName = rawArgs;
       }
 
-      if (targetTopicId === undefined) {
+      if (targetTopicId === undefined || !isValidTelegramTopicId(targetTopicId)) {
         await ctx.reply(
-          '⚠️ **Telegram Topic ID not found**.\n\n' +
-          'Telegram did not include a forum topic thread ID for this message.\n' +
+          '⚠️ **Telegram Topic ID not found or invalid**.\n\n' +
+          'Telegram did not include a forum topic thread ID for this message, or the provided topic ID is invalid.\n' +
           'This occurs when running in general chat or non-forum groups.\n\n' +
           '👉 Please run inside the forum topic, or specify the topic ID explicitly:\n' +
           '`/register_source <Topic ID> <Source Name>`'
@@ -60,15 +61,16 @@ export function registerSourceCommands(bot: Telegraf, token?: string): void {
         return;
       }
 
-      if (!sourceName) {
-        await ctx.reply('⚠️ Please provide a name for this source topic.\nExample: `/register_source Final Project`');
+      const nameValidation = validateResourceName(rawSourceName, 'Source name');
+      if (!nameValidation.valid) {
+        await ctx.reply(`⚠️ ${nameValidation.error}\nExample: \`/register_source Final Project\``);
         return;
       }
 
       const result = await sourceService.registerSource({
         chatId: ctx.chat.id,
         topicId: targetTopicId,
-        name: sourceName,
+        name: nameValidation.value!,
       });
 
       if (result.success && result.source) {
@@ -155,6 +157,11 @@ export function registerSourceCommands(bot: Telegraf, token?: string): void {
         return;
       }
 
+      if (!isValidUuid(sourceId)) {
+        await ctx.reply('❌ Invalid Source ID format. Expected a valid UUID (e.g. 12345678-1234-1234-1234-123456789abc).\n\nTip: Use `/list_sources` to copy the ID.');
+        return;
+      }
+
       const details = await sourceService.getSourceDetails(sourceId);
       if (!details) {
         await ctx.reply(`❌ Source not found with ID: \`${sourceId}\``);
@@ -193,7 +200,7 @@ export function registerSourceCommands(bot: Telegraf, token?: string): void {
     }
   });
 
-  // /remove_source <source_id>
+  // /remove_source <source_id> [--force]
   bot.command('remove_source', async (ctx) => {
     try {
       const isAuth = await isAuthorizedAdmin(ctx);
@@ -215,6 +222,11 @@ export function registerSourceCommands(bot: Telegraf, token?: string): void {
           '• Permanent deletion (only if no logs exist): `/remove_source <source_id> --force`\n\n' +
           'Tip: Use `/list_sources` to copy a source ID.'
         );
+        return;
+      }
+
+      if (!isValidUuid(sourceId)) {
+        await ctx.reply('❌ Invalid Source ID format. Expected a valid UUID.\n\nTip: Use `/list_sources` to find the ID.');
         return;
       }
 
@@ -265,6 +277,11 @@ export function registerSourceCommands(bot: Telegraf, token?: string): void {
 
       if (!sourceId) {
         await ctx.reply('ℹ️ Usage: `/activate_source <source_id>`\n\nTip: Use `/list_sources` to copy a source ID.');
+        return;
+      }
+
+      if (!isValidUuid(sourceId)) {
+        await ctx.reply('❌ Invalid Source ID format. Expected a valid UUID.\n\nTip: Use `/list_sources` to find the ID.');
         return;
       }
 

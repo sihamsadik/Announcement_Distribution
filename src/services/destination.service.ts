@@ -1,13 +1,12 @@
 import { DestinationGroup, SourceGroup } from '@prisma/client';
 import { prisma } from '../db/prisma';
+import { isValidUuid, isValidTelegramChatId, validateResourceName } from '../utils/validators';
 
 export interface RegisterDestinationInput {
   chatId: bigint | number | string;
   groupName: string;
   sourceGroupId: string;
 }
-
-export type DestinationWithSource = DestinationGroup & { sourceGroup: SourceGroup };
 
 export interface RegisterDestinationResult {
   success: boolean;
@@ -27,26 +26,40 @@ export interface DeleteDestinationResult {
   message: string;
 }
 
+export type DestinationWithSource = DestinationGroup & {
+  sourceGroup: SourceGroup;
+};
+
 export class DestinationService {
   /**
-   * Registers a Telegram destination group and associates it with a SourceGroup.
+   * Registers a destination group under an active source group.
+   * If the destination is already registered under the same source, returns the existing record idempotently.
    */
   async registerDestination(input: RegisterDestinationInput): Promise<RegisterDestinationResult> {
-    const trimmedName = input.groupName?.trim();
-    if (!trimmedName) {
+    const nameValidation = validateResourceName(input.groupName, 'Destination group name');
+    if (!nameValidation.valid) {
       return {
         success: false,
         isNew: false,
-        message: 'Destination group name cannot be empty.',
+        message: nameValidation.error!,
+      };
+    }
+    const trimmedGroupName = nameValidation.value!;
+
+    const trimmedSourceId = input.sourceGroupId?.trim();
+    if (!trimmedSourceId || !isValidUuid(trimmedSourceId)) {
+      return {
+        success: false,
+        isNew: false,
+        message: 'Invalid Source ID format. Expected a valid UUID.',
       };
     }
 
-    const trimmedSourceId = input.sourceGroupId?.trim();
-    if (!trimmedSourceId) {
+    if (!isValidTelegramChatId(input.chatId)) {
       return {
         success: false,
         isNew: false,
-        message: 'Source group ID cannot be empty.',
+        message: 'Invalid destination chat ID provided.',
       };
     }
 
@@ -110,11 +123,11 @@ export class DestinationService {
         };
       }
 
-      // 3. Create destination group record
-      const destination = await prisma.destinationGroup.create({
+      // 3. Create new destination record
+      const newDestination = await prisma.destinationGroup.create({
         data: {
           chatId: bigChatId,
-          groupName: trimmedName,
+          groupName: trimmedGroupName,
           sourceGroupId: trimmedSourceId,
           isActive: true,
         },
@@ -124,15 +137,15 @@ export class DestinationService {
       });
 
       console.log(
-        `[DestinationService] Successfully registered destination "${destination.groupName}" ` +
-        `(Chat: ${bigChatId}) under source "${destination.sourceGroup.name}" (ID: ${destination.sourceGroupId})`
+        `[DestinationService] Successfully registered destination "${newDestination.groupName}" ` +
+        `(Chat: ${bigChatId}) under source "${newDestination.sourceGroup.name}" (ID: ${trimmedSourceId})`
       );
 
       return {
         success: true,
         isNew: true,
-        message: `Destination group "${destination.groupName}" registered successfully under source "${destination.sourceGroup.name}".`,
-        destination,
+        message: `Destination group "${newDestination.groupName}" registered successfully!`,
+        destination: newDestination,
       };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -140,24 +153,33 @@ export class DestinationService {
       return {
         success: false,
         isNew: false,
-        message: 'Database error occurred while registering destination group.',
+        message: 'Database error occurred while registering destination.',
       };
     }
   }
 
   /**
-   * Retrieves all destination groups, optionally filtered by sourceGroupId.
+   * Lists destination groups. Optionally filtered by a specific source group ID.
    */
   async listDestinations(sourceGroupId?: string): Promise<DestinationWithSource[]> {
     try {
-      const whereClause = sourceGroupId?.trim() ? { sourceGroupId: sourceGroupId.trim() } : {};
+      const whereClause: any = {};
+      if (sourceGroupId) {
+        const trimmed = sourceGroupId.trim();
+        if (isValidUuid(trimmed)) {
+          whereClause.sourceGroupId = trimmed;
+        } else {
+          return [];
+        }
+      }
+
       return await prisma.destinationGroup.findMany({
         where: whereClause,
+        orderBy: {
+          createdAt: 'asc',
+        },
         include: {
           sourceGroup: true,
-        },
-        orderBy: {
-          createdAt: 'desc',
         },
       });
     } catch (err) {
@@ -168,11 +190,12 @@ export class DestinationService {
   }
 
   /**
-   * Retrieves only active destination groups for a specific source group.
+   * Retrieves active destination groups for a specific source group.
+   * Excludes inactive destination groups and ensures source itself is active.
    */
   async getActiveDestinations(sourceGroupId: string): Promise<DestinationGroup[]> {
     const trimmedId = sourceGroupId?.trim();
-    if (!trimmedId) {
+    if (!trimmedId || !isValidUuid(trimmedId)) {
       return [];
     }
 
@@ -207,8 +230,11 @@ export class DestinationService {
    */
   async getDestinationById(id: string): Promise<DestinationWithSource | null> {
     try {
+      const trimmed = id?.trim();
+      if (!trimmed || !isValidUuid(trimmed)) return null;
+
       return await prisma.destinationGroup.findUnique({
-        where: { id: id.trim() },
+        where: { id: trimmed },
         include: {
           sourceGroup: true,
         },
@@ -226,10 +252,10 @@ export class DestinationService {
    */
   async setDestinationStatus(id: string, isActive: boolean): Promise<UpdateDestinationStatusResult> {
     const trimmedId = id?.trim();
-    if (!trimmedId) {
+    if (!trimmedId || !isValidUuid(trimmedId)) {
       return {
         success: false,
-        message: 'Destination ID cannot be empty.',
+        message: 'Invalid Destination ID format. Expected a valid UUID.',
       };
     }
 
@@ -243,14 +269,6 @@ export class DestinationService {
         return {
           success: false,
           message: `Destination group with ID "${trimmedId}" was not found.`,
-        };
-      }
-
-      if (existing.isActive === isActive) {
-        return {
-          success: true,
-          message: `Destination group "${existing.groupName}" is already ${isActive ? 'active' : 'inactive'}.`,
-          destination: existing,
         };
       }
 
@@ -265,7 +283,7 @@ export class DestinationService {
 
       return {
         success: true,
-        message: `Destination group "${updated.groupName}" has been successfully ${action}.`,
+        message: `Destination group "${updated.groupName}" has been ${action}.`,
         destination: updated,
       };
     } catch (err) {
@@ -279,16 +297,17 @@ export class DestinationService {
   }
 
   /**
-   * Safe destination deletion:
-   * Prevents hard deletion if historical delivery logs exist to preserve audit history.
-   * Admins are instructed to deactivate instead.
+   * Attempts to permanently delete a destination group.
+   * CRITICAL DATA INTEGRITY SAFEGUARD:
+   * Rejects deletion if any historical forwarding records exist for this destination,
+   * instructing administrators to use soft-deactivation instead.
    */
   async deleteDestination(id: string): Promise<DeleteDestinationResult> {
     const trimmedId = id?.trim();
-    if (!trimmedId) {
+    if (!trimmedId || !isValidUuid(trimmedId)) {
       return {
         success: false,
-        message: 'Destination ID cannot be empty.',
+        message: 'Invalid Destination ID format. Expected a valid UUID.',
       };
     }
 
@@ -300,20 +319,21 @@ export class DestinationService {
       if (!existing) {
         return {
           success: false,
-          message: `Destination group with ID "${trimmedId}" was not found.`,
+          message: `Destination with ID "${trimmedId}" was not found.`,
         };
       }
 
-      const logCount = await prisma.forwardingLog.count({
+      // Check if forwarding logs exist for this destination
+      const logsCount = await prisma.forwardingLog.count({
         where: { destinationGroupId: trimmedId },
       });
 
-      if (logCount > 0) {
+      if (logsCount > 0) {
         return {
           success: false,
           message:
-            `Cannot delete destination "${existing.groupName}": ${logCount} historical forwarding log(s) exist. ` +
-            `To safely preserve delivery history, deactivate it using /remove_destination ${trimmedId}`,
+            `Cannot delete destination "${existing.groupName}": ${logsCount} historical forwarding log(s) exist. ` +
+            `To protect audit history, please use soft deactivation (/remove_destination ${trimmedId}) instead.`,
         };
       }
 
@@ -321,10 +341,11 @@ export class DestinationService {
         where: { id: trimmedId },
       });
 
-      console.log(`[DestinationService] Destination "${existing.groupName}" (${trimmedId}) deleted safely (0 forwarding logs existed).`);
+      console.log(`[DestinationService] Permanently deleted unused destination "${existing.groupName}" (${trimmedId}).`);
+
       return {
         success: true,
-        message: `Destination group "${existing.groupName}" has been permanently deleted.`,
+        message: `Destination "${existing.groupName}" was permanently deleted.`,
       };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);

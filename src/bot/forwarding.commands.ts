@@ -1,7 +1,8 @@
 import { Telegraf } from 'telegraf';
-import { isAuthorizedAdmin } from './auth';
+import { isAuthorizedAdmin, denyUnauthorizedAccess } from './auth';
 import { forwardingService } from '../services/forwarding.service';
 import { sanitizeError } from './bot';
+import { isValidTelegramChatId } from '../utils/validators';
 
 /**
  * Registers controlled message forwarding commands for administrator testing.
@@ -12,8 +13,7 @@ export function registerForwardingCommands(bot: Telegraf, token?: string): void 
     try {
       const isAuth = await isAuthorizedAdmin(ctx);
       if (!isAuth) {
-        console.warn(`[Security Alert] Unauthorized /test_forward attempt by user ${ctx.from?.id} in chat ${ctx.chat?.id}`);
-        await ctx.reply('⛔ Access denied: You are not authorized to test message forwarding.');
+        await denyUnauthorizedAccess(ctx, 'test message forwarding');
         return;
       }
 
@@ -54,8 +54,13 @@ export function registerForwardingCommands(bot: Telegraf, token?: string): void 
         return;
       }
 
-      if (!/^-?\d+$/.test(destinationChatIdStr)) {
+      if (!isValidTelegramChatId(destinationChatIdStr)) {
         await ctx.reply('⚠️ Invalid destination chat ID. Please provide a numeric Telegram chat ID (e.g. -1001234567890).');
+        return;
+      }
+
+      if (targetMessageId <= 0 || !Number.isInteger(targetMessageId)) {
+        await ctx.reply('⚠️ Invalid source message ID. Must be a positive integer.');
         return;
       }
 
@@ -79,21 +84,22 @@ export function registerForwardingCommands(bot: Telegraf, token?: string): void 
       if (result.success) {
         await ctx.reply(
           `✅ Test Forward Successful!\n\n` +
-          `📤 Source Chat: \`${sourceChatId}\`\n` +
-          `✉️ Source Message ID: #${targetMessageId}\n` +
-          `📥 Destination Chat: \`${destinationChatIdStr}\`\n` +
-          `🆔 Forwarded Message ID: #${result.forwardedMessageId}`
+          `• Source Chat: \`${sourceChatId}\`\n` +
+          `• Source Message ID: #${targetMessageId}\n` +
+          `• Destination Chat: \`${destinationChatIdStr}\`\n` +
+          `• Delivered Message ID: #${result.forwardedMessageId}`
         );
       } else {
         await ctx.reply(
           `❌ Test Forward Failed:\n\n` +
-          `🏷️ Error Category: \`${result.errorType}\`\n` +
-          `⚠️ Reason: ${result.errorMessage}`
+          `• Error Type: \`${result.errorType}\`\n` +
+          `• Transient: ${result.isTransient ? 'Yes (eligible for retry)' : 'No (permanent failure)'}\n` +
+          `• Details: ${result.errorMessage}`
         );
       }
     } catch (err) {
       console.error('[Telegram Bot] Error in /test_forward:', sanitizeError(err, token));
-      await ctx.reply('❌ An error occurred while executing the test forward.');
+      await ctx.reply('❌ An error occurred while testing message forwarding.');
     }
   });
 }
