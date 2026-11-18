@@ -1,460 +1,472 @@
 # Telegram Announcement Distribution System
 
-A Telegram bot service built with **Node.js**, **TypeScript**, **Telegraf**, and **PostgreSQL** to distribute final-project announcements from a designated source group to destination student groups.
+A robust, enterprise-grade Telegram bot service built with **Node.js**, **TypeScript**, **Telegraf**, **Prisma 7**, and **PostgreSQL** to distribute course announcements from designated source forum topics to student project groups with native forwarding, media album grouping, idempotency, and automated failure recovery.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Prerequisites](#prerequisites)
-- [Bot Creation via BotFather](#bot-creation-via-botfather)
-- [Environment Configuration](#environment-configuration)
-- [Telegram Bot Group Permissions & Privacy Mode](#telegram-bot-group-permissions--privacy-mode)
-- [Installation and Building](#installation-and-building)
-- [Database Schema & Prisma 7](#database-schema--prisma-7)
-- [Destination Group Management](#destination-group-management)
-- [Message Forwarding & Distribution Engine](#message-forwarding--distribution-engine)
-- [Persistent Delivery Tracking & Idempotency](#persistent-delivery-tracking--idempotency)
-- [Retry Mechanisms & Failure Recovery (Day 2 - Task 5)](#retry-mechanisms--failure-recovery-day-2---task-5)
-- [Running the Application](#running-the-application)
-- [Verification and Testing](#verification-and-testing)
-- [Security Considerations](#security-considerations)
+- [1. Architecture Overview](#1-architecture-overview)
+- [2. Message Distribution Flow](#2-message-distribution-flow)
+- [3. Database Schema & Entity Relationships](#3-database-schema--entity-relationships)
+- [4. Delivery Status Lifecycle](#4-delivery-status-lifecycle)
+- [5. Idempotency & Concurrency Safety](#5-idempotency--concurrency-safety)
+- [6. Retry Strategy & Failure Recovery](#6-retry-strategy--failure-recovery)
+- [7. Supported Message Types & Telegram Capabilities](#7-supported-message-types--telegram-capabilities)
+- [8. Telegram Group Permissions & Privacy Mode](#8-telegram-group-permissions--privacy-mode)
+- [9. Environment Configuration](#9-environment-configuration)
+- [10. Bot Commands Reference](#10-bot-commands-reference)
+- [11. Installation, Build & Startup](#11-installation-build--startup)
+- [12. Verification & Testing](#12-verification--testing)
+- [13. Known Limitations & Reliability Trade-offs](#13-known-limitations--reliability-trade-offs)
+- [14. Security Considerations](#14-security-considerations)
 
 ---
 
-## Overview
+## 1. Architecture Overview
 
-The Telegram Announcement Distribution System integrates with the Telegram Bot API to streamline communication during final projects. In its current initial phase:
-- It connects to the Telegram Bot API using Telegraf.
-- Handles `/start` and `/help` commands.
-- Provides graceful startup and shutdown.
-- Validates environment configurations securely.
+The system is architected as a modular, decoupled event-driven pipeline where Telegram updates are ingested, validated, persisted, and forwarded without data loss or duplicate deliveries.
+
+```mermaid
+flowchart TD
+    subgraph Telegram ["Telegram Cloud"]
+        User["Course Coordinator / Admin"]
+        StudentGroups["Destination Groups (A1, A2, ...)"]
+        TG_API["Telegram Bot API"]
+    end
+
+    subgraph BotApp ["Announcement Distribution System (Node.js / TypeScript)"]
+        Listener["Telegraf Bot Listener\n(src/bot/bot.ts)"]
+        Auth["Admin Authorization\n(src/bot/auth.ts)"]
+        Detector["Source Topic Detector\n(src/bot/detector.ts)"]
+        DistService["Distribution Service\n(src/services/distribution.service.ts)"]
+        AlbumService["Media Album Debounce Engine\n(src/services/album.service.ts)"]
+        ForwardService["Native Forwarding Engine\n(src/services/forwarding.service.ts)"]
+        DelivService["Delivery Tracking & Idempotency\n(src/services/delivery.service.ts)"]
+        RetryService["Background Retry Worker\n(src/services/retry.service.ts)"]
+    end
+
+    subgraph Database ["PostgreSQL Persistence (Prisma 7)"]
+        SourceTable[("SourceGroup")]
+        DestTable[("DestinationGroup")]
+        LogTable[("ForwardingLog")]
+    end
+
+    User -->|"Post Announcement"| TG_API
+    TG_API -->|"Update Event"| Listener
+    Listener --> Auth
+    Listener --> Detector
+    Detector -->|"Check Registered Source"| SourceTable
+    Detector -->|"Announcement Detected"| DistService
+
+    DistService -->|"Media Album Updates"| AlbumService
+    AlbumService -->|"Batch Flushed (forwardMessages)"| DistService
+
+    DistService -->|"1. Query Active Destinations"| DestTable
+    DistService -->|"2. Claim In-Flight (PENDING)"| DelivService
+    DelivService --> LogTable
+
+    DistService -->|"3. Native Forward"| ForwardService
+    ForwardService -->|"forwardMessage / forwardMessages"| TG_API
+    TG_API --> StudentGroups
+
+    ForwardService -->|"Result"| DistService
+    DistService -->|"4. Mark SUCCESS / RETRYING / FAILED"| DelivService
+
+    RetryService -->|"Poll Due Retries (Optimistic Lock)"| LogTable
+    RetryService -->|"Re-attempt Forward"| ForwardService
+```
+
+### Component Roles
+
+1. **Telegram Listener & Handlers** (`src/bot/bot.ts`, `src/bot/messages.ts`):
+   - Manages Telegraf lifecycle, incoming updates, polling, error catching, and graceful termination (`SIGINT`/`SIGTERM`).
+2. **Authorization Layer** (`src/bot/auth.ts`):
+   - Verifies whether a command sender is in `ADMIN_USER_IDS` or is an Administrator/Creator in the Telegram chat.
+3. **Source Detector** (`src/bot/detector.ts`):
+   - Filters out non-group messages, commands, bot messages, and extracts `message_thread_id` to match against registered sources.
+4. **Source & Destination Services** (`src/services/source.service.ts`, `src/services/destination.service.ts`):
+   - Handles multi-source isolation and destination lifecycle (registration, query, soft-deactivation).
+5. **Distribution Service** (`src/services/distribution.service.ts`):
+   - Orchestrates distribution across active destinations with inter-destination delay and partial failure isolation.
+6. **Album Service** (`src/services/album.service.ts`):
+   - Implements a sliding debounce collection window (500ms default, 2500ms ceiling) to collect multi-photo/video albums and forward them atomically via `forwardMessages`.
+7. **Forwarding Service** (`src/services/forwarding.service.ts`):
+   - Native forwarding engine classifying Telegram exceptions into transient vs permanent error categories.
+8. **Delivery Service** (`src/services/delivery.service.ts`):
+   - Enforces database-level idempotency, atomic concurrency gates, and stale claim recovery.
+9. **Retry Service** (`src/services/retry.service.ts`):
+   - Background worker with optimistic locking and exponential backoff to re-attempt transient failures.
 
 ---
 
-## Prerequisites
+## 2. Message Distribution Flow
 
-- **Node.js** (v18.x or later recommended; v20 LTS tested)
-- **npm** (v9+ or v10+)
+The sequence below illustrates what occurs when an announcement is posted in a registered forum topic:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin as Professor / Admin
+    participant TG as Telegram Bot API
+    participant Bot as Distribution Service
+    participant DB as PostgreSQL (Prisma)
+    participant Dest as Student Groups
+
+    Admin->>TG: Posts announcement in Source Topic
+    TG->>Bot: bot.on('message') update
+    Bot->>Bot: isEligibleMessage (exclude bots & commands)
+    Bot->>DB: detectSourceAnnouncement: findSource(chatId, topicId)
+    DB-->>Bot: SourceGroup record (Match found)
+    Bot->>DB: getActiveDestinations(sourceGroupId)
+    DB-->>Bot: [Dest1, Dest2, Dest3]
+
+    loop For Each Active Destination
+        Bot->>DB: claimDelivery(srcChatId, msgId, destId)
+        alt Already SUCCESS
+            DB-->>Bot: canDeliver = false (ALREADY_DELIVERED)
+            Bot->>Bot: Skip destination
+        else Already in-flight (<60s)
+            DB-->>Bot: canDeliver = false (ALREADY_PENDING)
+            Bot->>Bot: Skip concurrent attempt
+        else Unclaimed or Stale
+            DB-->>Bot: canDeliver = true (PENDING recorded)
+            Bot->>TG: forwardMessage(destChatId, srcChatId, msgId)
+            alt Forward Successful
+                TG-->>Bot: 200 OK (new message_id)
+                Bot->>DB: markSuccess(srcChatId, msgId, destId)
+                TG-->>Dest: Delivered with original attribution
+            else Transient Error (Timeout / 429 RateLimit)
+                TG-->>Bot: Error (ETIMEDOUT / retry_after)
+                Bot->>DB: markFailure (status: RETRYING, nextRetryAt: now + backoff)
+            else Permanent Error (Bot Kicked / Write Forbidden)
+                TG-->>Bot: Error (CHAT_WRITE_FORBIDDEN)
+                Bot->>DB: markFailure (status: FAILED, terminal)
+            end
+        end
+    end
+```
 
 ---
 
-## Bot Creation via BotFather
+## 3. Database Schema & Entity Relationships
 
-To create your Telegram bot and obtain an API token:
+The PostgreSQL database enforces relational integrity and composite uniqueness constraints via Prisma 7:
 
-1. Open Telegram and search for the official **[@BotFather](https://t.me/BotFather)**.
-2. Start a chat with BotFather and send the command:
-   ```text
-   /newbot
-   ```
-3. Enter a display name for your bot (e.g., `Final Project Announcement Bot`).
-4. Enter a unique username ending in `bot` (e.g., `FinalProjectAnnounce_bot`).
-5. BotFather will provide an HTTP API token formatted like:
-   ```text
-   123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
-   ```
-6. **Keep this token secret.** You will place it in your local `.env` file.
+```mermaid
+erDiagram
+    SourceGroup ||--o{ DestinationGroup : "has many"
+    DestinationGroup ||--o{ ForwardingLog : "tracks"
+
+    SourceGroup {
+        string id PK "UUID"
+        bigint chatId "Telegram Group Chat ID"
+        bigint topicId "Forum Topic Thread ID"
+        string name "Human Readable Name"
+        datetime createdAt
+    }
+
+    DestinationGroup {
+        string id PK "UUID"
+        string sourceGroupId FK "References SourceGroup.id"
+        bigint chatId "Telegram Destination Chat ID"
+        string groupName "Display Group Name"
+        boolean isActive "Active Toggle"
+        datetime createdAt
+    }
+
+    ForwardingLog {
+        string id PK "UUID"
+        bigint sourceChatId "Source Group Chat ID"
+        int sourceMessageId "Source Message ID"
+        string destinationGroupId FK "References DestinationGroup.id"
+        ForwardingStatus status "PENDING | RETRYING | SUCCESS | FAILED"
+        string errorMessage "Truncated Error Description"
+        int retryCount "Attempt Counter (0..maxRetries)"
+        datetime lastAttemptAt "Timestamp of Last Attempt"
+        datetime nextRetryAt "Timestamp Scheduled for Next Retry"
+        datetime createdAt
+        datetime updatedAt
+    }
+```
+
+### Relational Constraints and Indexes
+- **`SourceGroup`**:
+  - `@@unique([chatId, topicId])`: Guarantees a topic in a group can only be registered once.
+  - `@@index([chatId])`: Fast lookup of forum topics per chat.
+- **`DestinationGroup`**:
+  - `@@unique([sourceGroupId, chatId])`: Prevents duplicate registration of the same destination under one source.
+  - `@@index([sourceGroupId, isActive])`: Optimizes querying active destinations during message distribution.
+- **`ForwardingLog`**:
+  - `@@unique([sourceChatId, sourceMessageId, destinationGroupId])`: **Core idempotency constraint**. Guarantees that at most one delivery record exists for a message-destination pair.
+  - `@@index([status, nextRetryAt])`: Efficient index scan for background retry polling (`status = 'RETRYING' AND nextRetryAt <= NOW()`).
+  - `@@index([sourceChatId, sourceMessageId])`: Quick status audits for specific announcements.
 
 ---
 
-## Environment Configuration
+## 4. Delivery Status Lifecycle
 
-1. Copy `.env.example` to `.env` if `.env` does not already exist:
-   ```bash
-   cp .env.example .env
-   ```
-2. Open `.env` and set your bot token:
-   ```env
-   TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
-   ```
-3. Never commit `.env` to Git. The `.gitignore` file is configured to exclude all `.env` files.
+Deliveries transition through an explicit state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: claimDelivery() atomically inserts record
+    PENDING --> SUCCESS: Telegram Bot API returns 200 OK
+    PENDING --> RETRYING: Transient failure (Network / Rate Limit / 5xx)
+    PENDING --> FAILED: Permanent failure (Kicked / Write Forbidden / Invalid Chat)
+    PENDING --> PENDING: Stale claim (>60s crash recovery)
+
+    RETRYING --> PENDING: Due retry claimed via optimistic lock
+    RETRYING --> FAILED: Maximum retry count reached (retryCount >= maxRetries)
+
+    SUCCESS --> [*]: Terminal (never forwarded again)
+    FAILED --> [*]: Terminal
+```
+
+- **`PENDING`**: Delivery is currently being processed. Prevents concurrent workers or re-delivered updates from executing a duplicate send.
+- **`SUCCESS`**: Delivery was acknowledged by Telegram. This state is terminal and will never be re-forwarded.
+- **`RETRYING`**: Transient failure occurred. Delivery is scheduled for automated background retry with exponential backoff.
+- **`FAILED`**: Terminal failure. Either the error was non-retryable (e.g. bot lack permissions) or maximum retry attempts were exhausted.
 
 ---
 
-## Telegram Bot Group Permissions & Privacy Mode
+## 5. Idempotency & Concurrency Safety
 
-To prepare for message reception and distribution in subsequent milestones, the following Telegram settings are required:
+### 1. Database-Enforced Unique Constraint
+The PostgreSQL composite constraint `@@unique([sourceChatId, sourceMessageId, destinationGroupId])` serves as the primary idempotency barrier. Even if multiple processes attempt to insert delivery records concurrently, PostgreSQL permits only one to commit while rejecting duplicates with Prisma error `P2002`.
+
+### 2. Pre-Execution Idempotency Check
+Before contacting Telegram, `claimDelivery()` checks the database:
+- If `SUCCESS` exists: The destination is immediately skipped (`Already delivered (Idempotency)`).
+- If `PENDING` exists (<60 seconds): The message is currently in flight by another worker and is skipped (`Delivery currently in flight`).
+
+### 3. Crash Recovery for In-Flight Deliveries
+If the application crashes while a delivery is in `PENDING` state:
+- The record becomes stale after 60 seconds (`updatedAt` threshold).
+- On the next attempt or application restart, `claimDelivery()` detects the stale record, logs a warning, and safely reclaims it for delivery.
+- Additionally, `retryService.recoverStalePendingDeliveries()` runs automatically at startup, finding all orphaned `PENDING` records and converting them to `RETRYING` with immediate eligibility.
+
+### 4. Distributed Uncertainty Boundary (At-Least-Once Delivery)
+External API calls cannot participate in a two-phase database transaction with Telegram's servers. In the rare event that:
+1. The bot invokes `telegram.forwardMessage(...)` and Telegram accepts the message.
+2. The bot process crashes (e.g. OOM killer or power loss) **before** writing `SUCCESS` to PostgreSQL.
+3. Upon restart, the database only reflects `PENDING` (>60s stale) and re-attempts delivery.
+This creates a small window where an announcement may be delivered more than once upon ungraceful crash recovery. This is a fundamental trade-off of distributed network systems without two-phase commit.
+
+---
+
+## 6. Retry Strategy & Failure Recovery
+
+### 1. Error Classification Matrix
+
+| Error Type | Category | Transient? | Action |
+| :--- | :--- | :--- | :--- |
+| `RATE_LIMITED` | HTTP 429 ("Too Many Requests") | Yes | Scheduled retry respecting `retry_after` |
+| `NETWORK_ERROR` | `ETIMEDOUT`, `ECONNRESET`, fetch failed | Yes | Exponential backoff retry |
+| `SERVER_ERROR` | Telegram 500, 502, 503, 504 | Yes | Exponential backoff retry |
+| `BOT_NOT_MEMBER` | Bot kicked or not in destination group | No | Immediate terminal `FAILED` |
+| `PERMISSION_DENIED` | `CHAT_WRITE_FORBIDDEN`, no send rights | No | Immediate terminal `FAILED` |
+| `PROTECTED_CONTENT` | Source chat forbids forwarding | No | Immediate terminal `FAILED` |
+| `MESSAGE_NOT_FOUND` | Message deleted in source | No | Immediate terminal `FAILED` |
+| `INVALID_CHAT_ID` | Bad destination chat ID | No | Immediate terminal `FAILED` |
+
+### 2. Exponential Backoff Formula
+$$\text{delaySeconds} = \min\left(\max\left(\text{initialDelay} \times 2^{\text{retryCount}},\, \text{retryAfterSeconds}\right),\, \text{maxDelay}\right)$$
+- If Telegram returns `retry_after`, the backoff delay directly respects Telegram's requested wait time.
+- Standard defaults: Initial delay = 5s, Max delay = 300s, Max retries = 3.
+
+### 3. Concurrency Safety & Optimistic Locking
+Background retry polling claims records using atomic conditional updates:
+```sql
+UPDATE "ForwardingLog"
+SET "status" = 'PENDING', "updatedAt" = NOW()
+WHERE "id" = :id AND "updatedAt" = :expectedUpdatedAt AND "status" = 'RETRYING';
+```
+If two workers attempt to claim the same retry concurrently, only one update returns row count 1; the other returns 0 and safely skips.
+
+---
+
+## 7. Supported Message Types & Telegram Capabilities
+
+All messages are forwarded natively via Telegram Bot API (`forwardMessage` / `forwardMessages`). This preserves original author attribution, avoids downloading media to disk, and eliminates network upload overhead:
+
+| Message Type | Telegram Format | Attribution Preserved | Native Grouping |
+| :--- | :--- | :---: | :---: |
+| **Text** | Plain text, markdown, HTML, code blocks | Yes | N/A |
+| **Photos** | JPEG / PNG with or without captions | Yes | Yes (single) |
+| **Media Albums** | 2–10 Photos & Videos sharing `media_group_id` | Yes | Yes (grouped via `forwardMessages`) |
+| **PDF Documents** | PDF files with file name and caption | Yes | Yes |
+| **General Documents**| DOCX, XLSX, ZIP, TAR, TXT archives | Yes | Yes |
+| **Videos** | MP4, MOV with captions and duration | Yes | Yes |
+| **Voice Messages** | OGG Opus voice notes with audio waveform | Yes | Yes |
+| **Video Notes** | Round circular video clips | Yes | Yes |
+| **Stickers** | Static, animated (.TGS), video stickers (.WEBM)| Yes | Yes |
+| **Animations / GIFs**| Animated GIFs with captions | Yes | Yes |
+| **Polls & Quizzes** | Native Telegram poll widgets | Yes | Yes |
+
+---
+
+## 8. Telegram Group Permissions & Privacy Mode
 
 ### 1. Group Privacy Mode
-- By default, Telegram bots operate with **Group Privacy Mode** enabled. In this mode, bots only receive:
-  - Commands that start with `/` (e.g. `/start`, `/help`).
-  - Direct mentions of the bot (e.g. `@YourBotName`).
-  - Replies to the bot's own messages.
-  - Messages if the bot is an Administrator in the group.
-- **For Announcement Distribution**: The bot will need to observe announcements published in the designated source group.
-  - **Recommended Approach**: Add the bot as an **Administrator** in the source group. When a bot is an administrator, Telegram automatically disables privacy mode restrictions for that group, allowing it to receive announcement posts.
-  - **Alternative Approach**: In `@BotFather`, send `/setprivacy`, choose your bot, and set it to `Disable`. This allows the bot to receive normal group messages even as a regular member.
-  - *Note*: Always adjust privacy settings exclusively via BotFather or the Telegram client; do not use unsupported automation.
+Telegram bots operate with **Group Privacy Mode** enabled by default. In privacy mode, bots only receive:
+- Commands starting with `/`.
+- Direct `@mentions`.
+- Replies to the bot's own messages.
+- Messages in groups where the bot is an **Administrator**.
 
-### 2. Administrator Access in the Source Group
-- Add the bot to the primary announcement source group.
-- Promote the bot to **Administrator** with at minimum the permission to **Read Messages**.
+**Requirement**: To detect announcements in the source group without mentioning the bot:
+1. Add the bot to the source group.
+2. Promote the bot to **Administrator** (or disable Group Privacy via `@BotFather` -> `/setprivacy` -> `Disable`).
 
-### 3. Destination Groups Permissions
-- Add the bot to each destination student project group.
-- Ensure the bot has permission to **Send Messages** (as well as embed links or send media if announcements contain them).
-- Administrator status in destination groups is optional unless group settings restrict regular members from sending messages.
+### 2. Destination Group Permissions
+In each student destination group:
+- Ensure the bot is a member and has permissions to:
+  - **Send Messages**
+  - **Send Photos & Videos**
+  - **Send Documents**
+- Administrator status in destination groups is optional unless general group permissions restrict regular members from posting.
 
 ---
 
-## Installation and Building
+## 9. Environment Configuration
 
-Install project dependencies:
+Create a `.env` file in the root directory (based on `.env.example`):
+
+```env
+# Telegram Bot Token from @BotFather (Required)
+TELEGRAM_BOT_TOKEN="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"
+
+# PostgreSQL Database Connection URL (Required)
+DATABASE_URL="postgresql://postgres:postgres@localhost:5433/announcement_db?schema=public&host=/tmp"
+
+# Comma-separated Administrator Telegram User IDs (Optional)
+ADMIN_USER_IDS="123456789,987654321"
+
+# Retry Configuration (Optional defaults shown)
+MAX_RETRY_COUNT=3
+INITIAL_RETRY_DELAY_SECONDS=5
+MAX_RETRY_DELAY_SECONDS=300
+RETRY_POLL_INTERVAL_MS=10000
+
+# Application Environment
+NODE_ENV="development"
+```
+
+---
+
+## 10. Bot Commands Reference
+
+| Command | Usage | Description | Access |
+| :--- | :--- | :--- | :--- |
+| `/start` | `/start` | Bot welcome message | Public |
+| `/help` | `/help` | Help documentation and instructions | Public |
+| `/register_source` | `/register_source [topicId] <name>` | Registers forum topic as an announcement source | Admins Only |
+| `/list_sources` | `/list_sources` | Lists all registered announcement sources | Admins Only |
+| `/register_destination` | `/register_destination <source_id> <name>` | Registers student group under a source topic | Admins Only |
+| `/list_destinations` | `/list_destinations [source_id]` | Lists registered destinations | Admins Only |
+| `/remove_destination` | `/remove_destination <dest_id>` | Soft-deactivates destination (`isActive: false`) | Admins Only |
+| `/activate_destination`| `/activate_destination <dest_id>` | Reactivates destination (`isActive: true`) | Admins Only |
+| `/test_forward` | `/test_forward <dest_chat_id> [msg_id]` | Tests forwarding a single message | Admins Only |
+
+---
+
+## 11. Installation, Build & Startup
+
+### 1. Prerequisites
+- **Node.js**: v18.x or v20.x LTS
+- **npm**: v9+ or v10+
+- **PostgreSQL**: v14, v15, or v16
+
+### 2. Installation
 ```bash
 npm install
 ```
 
-Compile TypeScript to JavaScript (`dist/`):
+### 3. Database Migration
+```bash
+# Validate schema
+npx prisma validate
+
+# Run migrations
+npx prisma migrate dev --name init_database
+
+# Generate client
+npx prisma generate
+```
+
+### 4. Build TypeScript
 ```bash
 npm run build
 ```
 
-Run test suite:
+### 5. Running the Application
 ```bash
-npm test
-```
-
----
-
-## Database Schema & Prisma 7
-
-The application uses **PostgreSQL** and **Prisma 7** for data persistence.
-
-### Models
-
-1. **`SourceGroup`**: Represents an announcement origin (a Telegram group chat and specific topic/thread ID).
-   - `id`: UUID Primary Key
-   - `chatId`: BigInt (Telegram Chat ID)
-   - `topicId`: BigInt (Telegram Topic Thread ID)
-   - `name`: Human-readable identifier
-   - Unique: `(chatId, topicId)`
-
-2. **`DestinationGroup`**: Represents student groups mapped to receive announcements.
-   - `id`: UUID Primary Key
-   - `sourceGroupId`: Foreign Key referencing `SourceGroup.id` (`onDelete: Cascade`)
-   - `chatId`: BigInt (Telegram Destination Chat ID)
-   - `groupName`: Human-readable name
-   - `isActive`: Boolean flag (default `true`)
-   - Unique: `(sourceGroupId, chatId)`
-
-3. **`ForwardingLog`**: Tracks delivery history and guards against duplicate forwards.
-   - `id`: UUID Primary Key
-   - `sourceChatId`: BigInt
-   - `sourceMessageId`: Int
-   - `destinationGroupId`: Foreign Key referencing `DestinationGroup.id` (`onDelete: Cascade`)
-   - `status`: `ForwardingStatus` enum (`SUCCESS`, `FAILED`)
-   - `errorMessage`: Optional text describing failures
-   - Unique: `(sourceChatId, sourceMessageId, destinationGroupId)`
-
-### Prisma 7 Commands
-
-- **Validate schema**:
-  ```bash
-  npx prisma validate
-  ```
-- **Apply migrations**:
-  ```bash
-  npx prisma migrate dev --name init_database
-  ```
-- **Generate Prisma Client**:
-  ```bash
-  npx prisma generate
-  ```
-
----
-
-## Source Group & Topic Detection
-
-The system can monitor specific Telegram forum topics within course supergroups to identify new announcements.
-
-### How It Works
-
-1. **Registration**: An authorized administrator runs `/register_source` inside the course forum topic (or specifies the topic ID explicitly). The group's `chatId` and `topicId` are stored in the `SourceGroup` table.
-2. **Detection**: Whenever a new message arrives in a group:
-   - The bot extracts `chat.id` and `message_thread_id`.
-   - Messages from private chats, unregistered groups, or non-topic messages are safely ignored.
-   - If the `(chatId, topicId)` pair matches a registered source, the message is recognized and logged as a new announcement.
-3. **Authorization**:
-   - Only users whose IDs are defined in `ADMIN_USER_IDS` or users who are Administrators in the Telegram group can register sources.
-
-### Bot Commands
-
-| Command | Description | Permissions |
-| :--- | :--- | :--- |
-| `/start` | Introduces the bot and welcome message | Public |
-| `/help` | Explains bot features and commands | Public |
-| `/register_source [topicId] <name>` | Registers the current group topic as an announcement source | Admins Only |
-| `/list_sources` | Displays all registered source groups and topics with their IDs | Admins Only |
-| `/register_destination <source_id> <group_name>` | Registers the current student group as a destination linked to a source | Admins Only |
-| `/list_destinations [source_id]` | Displays destinations (optionally filtered by source ID) | Admins Only |
-| `/remove_destination <destination_id>` | Deactivates a destination group (`isActive: false`, preserves history) | Admins Only |
-| `/activate_destination <destination_id>` | Reactivates a previously deactivated destination group | Admins Only |
-| `/test_forward <destination_chat_id> [msg_id]` | Tests forwarding a single message to a destination (reply to message or pass ID) | Admins Only |
-
-#### Usage Examples:
-
-- **Register a Source Topic**:
-  ```text
-  /register_source Final Project Announcements
-  ```
-  *(or `/register_source 42 Final Project Announcements` with explicit topic ID)*
-
-- **Register a Destination Group**:
-  Run directly inside the student Telegram group:
-  ```text
-  /register_destination <source_id> Final Project Team 1
-  ```
-
-- **List Destinations**:
-  ```text
-  /list_destinations
-  /list_destinations <source_id>
-  ```
-
-- **Deactivate / Reactivate Destination**:
-  ```text
-  /remove_destination <destination_id>
-  /activate_destination <destination_id>
-  ```
-
-- **Test Forwarding a Message**:
-  Reply to any announcement message in the source group:
-  ```text
-  /test_forward -1009876543210
-  ```
-  *(or pass the source message ID explicitly: `/test_forward -1009876543210 42`)*
-
----
-
-## Announcement Distribution Service
-
-The distribution service ([src/services/distribution.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/distribution.service.ts)) connects source-topic detection, active destination retrieval, and message forwarding into an end-to-end automated pipeline:
-
-1. **Automatic Detection**: When an announcement is published in a registered source forum topic, the system automatically detects the source group and topic thread ID.
-2. **Active Group Filtering**: Only active destinations (`isActive: true`) associated with that specific `sourceGroupId` receive the announcement. Inactive destinations and destinations associated with other source topics are excluded.
-3. **Loop & Command Protection**:
-   - Messages sent by any bot (`message.from.is_bot = true`) are ignored to prevent feedback loops.
-   - The bot's own administrative updates are ignored.
-   - Bot commands (starting with `/`) are ignored and not forwarded to destination groups.
-4. **Resilience & Partial Failure Handling**:
-   - Messages are forwarded sequentially to all active destinations.
-   - Individual forwarding failures (e.g. `BOT_NOT_MEMBER`, `PERMISSION_DENIED`, `RATE_LIMITED`) do not stop delivery to the remaining destinations.
-   - An in-memory structured delivery summary (`DistributionSummary`) records the total destinations, successful count, failed count, and individual destination outcomes.
-
----
-
-## Message Forwarding Engine
-
-The message forwarding engine ([src/services/forwarding.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/forwarding.service.ts)) enables native Telegram message forwarding:
-
-1. **Native Forwarding**: Uses Telegram's `telegram.forwardMessage(...)` API. This preserves original sender/author attribution, supports all media formats (photos, documents, videos, text, voice, audio), and avoids costly media download/re-upload cycles.
-2. **Error Taxonomy**: Telegram API errors are categorized into structured error types (`BOT_NOT_MEMBER`, `PERMISSION_DENIED`, `MESSAGE_NOT_FOUND`, `PROTECTED_CONTENT`, `RATE_LIMITED`, `INVALID_CHAT_ID`, `UNKNOWN_ERROR`) with clear explanations.
-3. **Controlled Testing**: The `/test_forward` command allows administrators to test single-message forwarding safely without triggering distribution to all groups. Bot tokens are completely sanitized from logs and error messages.
-
----
-
-## Media Types, Media Albums, and Telegram Message Edge Cases
-
-The distribution pipeline natively supports different message types and Telegram-specific operational edge cases:
-
-### 1. Supported Message Types
-All message types are forwarded natively via Telegram Bot API without re-uploading or downloading files:
-- **Text Announcements**: Plain text with formatting entities (bold, italic, monospace, links).
-- **Photos**: Single photos with or without captions.
-- **Documents**: PDFs, Word documents, slide decks, ZIP archives, spreadsheets.
-- **Videos**: MP4/MOV videos with captions.
-- **Audio Files**: MP3, podcasts, or music files.
-- **Voice Messages**: OGG/Opus voice notes with waveforms preserved.
-- **Video Messages (Video Notes)**: Circular round video clips.
-- **Stickers**: Static, animated (TGS), and video stickers (WEBM).
-- **Animations**: GIFs with captions.
-- **Polls**: Regular and quiz polls.
-- **Contacts, Locations, Venues, and Dice**: Embedded native Telegram objects.
-
-### 2. Media Album Collection and Batching Strategy
-Telegram delivers media group items (albums of photos or videos) as individual message updates rather than a single atomic update.
-- **Sliding Debounce Window**: [src/services/album.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/album.service.ts) accumulates messages sharing the same `media_group_id` using a configurable sliding debounce window (default **500ms**).
-- **Hard Ceiling**: A maximum ceiling (default **2500ms**) prevents indefinite waiting if network delays occur.
-- **Trade-off Analysis**: A collection window of 500ms strikes the optimal balance between waiting for all updates to arrive over the network and maintaining near-instantaneous forwarding delivery.
-- **Sequence Preservation**: Message IDs are sorted in strictly ascending order before forwarding.
-- **Atomic Forwarding**: Uses Telegram's native `telegram.forwardMessages(destChatId, srcChatId, messageIds)` API, keeping the album grouped in destination groups.
-- **Duplicate Prevention**: Memory cache of recently finalized `media_group_id` keys prevents late-arriving updates from re-triggering distribution.
-
-### 3. Handling Telegram Forwarding Limitations & Protected Content
-- **Protected Content**: Groups or channels with "Restrict saving content" enabled reject forwarding with `CHAT_FORWARDS_RESTRICTED`. The system classifies this error (`PROTECTED_CONTENT`), logs the event, and continues to remaining destinations without crashing.
-- **Missing / Deleted Messages**: Handled via `MESSAGE_NOT_FOUND` without interrupting the batch.
-- **Unauthorized / Removed Bot**: When a bot is kicked from a destination group, it is categorized as `BOT_NOT_MEMBER`, allowing other destinations to receive the announcement cleanly.
-
-### 4. Rate-Limit Handling
-- **Recognition**: Telegram Bot API 429 errors (`Too Many Requests: retry after X`) and `parameters.retry_after` are parsed automatically into `retryAfterSeconds`.
-- **Sequential Backoff**: If rate-limited on a destination, the system pauses execution for `retryAfterSeconds` (capped at a safe ceiling of 10s) before attempting subsequent destinations.
-- **Burst Mitigation**: A gentle delay (`interDestinationDelayMs = 50ms` in production, `0ms` in test mode) paces delivery across multi-group broadcasts.
-
----
-
-## Manual Testing Checklist (Real Telegram Verification)
-
-To test the system manually in live Telegram groups:
-
-1. **Text Announcement**: Post a text message in the registered source topic; verify all active destination groups receive the forwarded message with source attribution.
-2. **Photo with Caption**: Post a photo with an explanatory caption; verify destination groups receive the image with caption intact.
-3. **Multiple Photos in One Album**: Post an album of 3–5 photos; verify that destinations receive the album grouped as a single media group and only once.
-4. **PDF Document**: Upload a PDF file in the source topic; verify that students can download and open the document directly.
-5. **Video**: Post a video with caption; verify video playback and caption are preserved in destinations.
-6. **Voice Message**: Record and send a voice memo; verify audio playback in destination groups.
-7. **Sticker**: Send a sticker; verify it appears in all destination groups.
-8. **Protected Content**: Forward a message from a channel with restricted saving; verify the system logs `PROTECTED_CONTENT` and does not crash.
-9. **Multi-Destination Album Delivery**: Verify an album reaches multiple registered groups concurrently.
-10. **Partial Failure**: Remove the bot from one destination group; post an announcement and verify remaining destination groups still receive the message.
-11. **Rate-Limit Handling**: Broadcast an announcement to multiple destinations; verify logs demonstrate steady pacing without Telegram 429 drops.
-12. **Source Topic Isolation**: Register two source topics (e.g. Topic A and Topic B with separate destination groups); post in Topic A and verify Topic B destinations receive nothing.
-
----
-
-## Persistent Delivery Tracking and Duplicate Prevention (Idempotency)
-
-The delivery tracking engine ([src/services/delivery.service.ts](file:///home/saw/Downloads/Announcement_Distribution/src/services/delivery.service.ts)) integrates directly with the PostgreSQL `ForwardingLog` model to enforce idempotency and prevent duplicate deliveries across restarts and re-delivered Telegram updates:
-
-### 1. Delivery Status Lifecycle
-Each forwarding attempt transitions through an explicit lifecycle:
-- **`PENDING`**: Atomically recorded before calling the Telegram Bot API. Indicates a delivery is currently in flight.
-- **`SUCCESS`**: Recorded when Telegram acknowledges delivery (`telegram.forwardMessage` or `telegram.forwardMessages` returns successfully).
-- **`FAILED`**: Recorded when Telegram rejects the forward (e.g. `BOT_NOT_MEMBER`, `PERMISSION_DENIED`, `PROTECTED_CONTENT`), storing an error description.
-
-```mermaid
-stateDiagram-v2
-    [*] --> PENDING: claimDelivery() / claimAlbumDelivery()
-    PENDING --> SUCCESS: telegram.forwardMessage() succeeds
-    PENDING --> FAILED: telegram.forwardMessage() fails
-    FAILED --> PENDING: Administrator retry
-    PENDING --> PENDING: Stale reclaim (>60s crash recovery)
-    SUCCESS --> [*]: Terminal (never re-delivered)
-```
-
-### 2. Idempotency & Concurrency Safety
-- **Unique Database Constraint**: PostgreSQL enforces `@@unique([sourceChatId, sourceMessageId, destinationGroupId])`. At most one delivery record can ever exist for a message-destination pair.
-- **Pre-Execution Check**: Before calling Telegram, the system checks whether a `SUCCESS` record already exists. If found, the destination is skipped immediately.
-- **Atomic Concurrency Gate**: If two processes attempt to deliver the same message simultaneously, the PostgreSQL unique index causes the second `create` to fail with Prisma error `P2002`. The catch handler resolves the race condition cleanly without duplicating messages.
-- **Recovery of Interrupted Processing**: If a worker crashes while a delivery is `PENDING`, the record becomes stale after 60 seconds (`updatedAt` threshold). On subsequent runs, `claimDelivery` identifies stale pending records and reclaims them safely.
-
-### 3. Media Album Tracking
-For Telegram media groups (albums with multiple photos/videos), each individual message ID within the album is tracked with its own record in `ForwardingLog`. An album is skipped only when all of its member message IDs have succeeded. If an album forward fails, all member items are transitioned to `FAILED`.
-
----
-
-## Known Reliability Limitations
-
-1. **In-Memory Album Debounce Buffer**: Media album collection accumulates items in an in-memory buffer for 500ms before dispatching. If the bot crashes during the 500ms collection window, pending unforwarded album updates in memory are discarded until re-posted.
-2. **Sequential Delivery Loop**: Delivery across destination groups is executed sequentially in the event loop with polite pacing (`50ms`). For large-scale broadcasts across hundreds of groups, a distributed background queue (e.g. BullMQ / Redis) would provide asynchronous sharding.
-3. **Database Idempotency vs Exactly-Once External Delivery**: The database unique constraint guarantees that the *local database* records at most one delivery. However, because external network calls cannot participate in a two-phase commit with Telegram's servers, a crash occurring precisely between Telegram receiving a message and PostgreSQL committing `SUCCESS` could result in an at-least-once re-send upon crash recovery.
-
----
-
-## Destination Group Management
-
-Destination groups represent the student project groups that receive announcements:
-1. **One-to-Many Association**: Each destination group links to exactly one source topic via `sourceGroupId` in `DestinationGroup`. One source topic can distribute to dozens of destination groups.
-2. **Execution Context**: `/register_destination` must be run directly inside the student Telegram group (private chat attempts are rejected).
-3. **Soft Deactivation**: `/remove_destination` deactivates the destination (`isActive = false`) rather than deleting it. This preserves delivery history and audit logs while stopping future forwards until reactivated via `/activate_destination`.
-4. **Permissions**: The bot must be added to each destination group and granted permission to send messages.
-
----
-
-## Message Forwarding & Distribution Engine
-
-The system forwards announcements natively using the Telegram Bot API (`forwardMessage` / `forwardMessages`):
-- **Content Types**: Supports plain text, photos with captions, PDFs and documents, videos, audio, voice notes, video notes, stickers, and animations without re-uploading files.
-- **Media Albums**: Multi-photo/document albums sharing a `media_group_id` are debounced (300ms window) and forwarded atomically via `telegram.forwardMessages` where supported, maintaining visual integrity.
-- **Inter-Destination Delay**: Enforces a gentle configurable delay (50ms) between destination sends to comply with Telegram rate limit guidance.
-
----
-
-## Persistent Delivery Tracking & Idempotency
-
-Every forwarding attempt is recorded in the `ForwardingLog` table:
-- **Composite Key Idempotency**: Unique constraint `@@unique([sourceChatId, sourceMessageId, destinationGroupId])` guarantees that no message is ever delivered multiple times to the same destination group.
-- **In-Flight Claiming**: Before forwarding, the delivery service claims an in-flight delivery by inserting or locking a `PENDING` log. If another worker or re-delivered webhook attempts delivery, it is detected and skipped.
-- **Stale Claim Recovery**: Stale `PENDING` records (>60s) from interrupted processes are automatically recovered.
-
----
-
-## Retry Mechanisms & Failure Recovery (Day 2 - Task 5)
-
-The system features an autonomous, database-backed retry mechanism for handling temporary Telegram API and network disruptions:
-
-### 1. Error Classification
-Forwarding errors are automatically inspected and categorized:
-- **Transient Errors**: Network timeouts (`ETIMEDOUT`, `ECONNRESET`), socket hang-ups, HTTP 5xx Telegram server errors (`500`, `502`, `503`, `504`), and HTTP 429 rate limits (`Too Many Requests: retry after X`). These trigger automated retries.
-- **Permanent Errors**: Bot removed from destination (`BOT_NOT_MEMBER`), write permissions denied (`CHAT_WRITE_FORBIDDEN`), invalid chat ID (`INVALID_CHAT_ID`), protected chat content (`PROTECTED_CONTENT`), and deleted messages (`MESSAGE_NOT_FOUND`). These immediately transition to `FAILED` without retrying.
-
-### 2. Exponential Backoff & Rate Limit Handling
-- **Formula**: `delayMs = Math.min(Math.max(initialDelay * 2^retryCount, retryAfterSeconds), maxDelay) * 1000`
-- **Rate Limits**: If Telegram returns a `retry_after` parameter, the retry delay respects Telegram's exact requested waiting period.
-- **Configuration Parameters** (via `.env`):
-  - `MAX_RETRY_COUNT`: Maximum retry attempts before marking terminal `FAILED` (default: `3`).
-  - `INITIAL_RETRY_DELAY_SECONDS`: Base backoff interval (default: `5`).
-  - `MAX_RETRY_DELAY_SECONDS`: Maximum backoff interval cap (default: `300`).
-  - `RETRY_POLL_INTERVAL_MS`: Periodic background retry polling interval (default: `10000`).
-
-### 3. Concurrency Safety & Optimistic Locking
-- Retries are stored persistently in PostgreSQL with status `RETRYING` and a indexed `nextRetryAt` timestamp (`@@index([status, nextRetryAt])`).
-- When polling for due retries (`nextRetryAt <= NOW()`), workers claim records atomically using PostgreSQL optimistic locking (`UPDATE "ForwardingLog" SET "updatedAt" = NOW() WHERE "id" = :id AND "updatedAt" = :expectedUpdatedAt AND "status" = 'RETRYING'`).
-- This guarantees that multiple background workers or clustering cannot execute duplicate retries.
-
-### 4. Process Restart Recovery
-- When the bot initializes, `recoverStalePendingDeliveries()` checks the database for any `PENDING` delivery records left hanging (e.g. from an ungraceful crash or container restart >60s ago) and transitions them to `RETRYING` with `nextRetryAt = NOW()`, ensuring zero message loss.
-
----
-
-## Running the Application
-
-### Development Mode (with hot-reloading via `tsx`):
-```bash
+# Development mode (with live watch via tsx)
 npm run dev
-```
 
-### Production Mode (compiles and executes JavaScript):
-```bash
-npm run build
+# Production mode
 npm start
 ```
 
 ---
 
-## Verification and Testing
+## 12. Verification & Testing
 
-To verify the bot setup end-to-end:
+### 1. Automated Test Suite (Jest)
+The test suite consists of 11 comprehensive suites and 162 unit & integration tests covering all system aspects:
 
-1. **Configure Token**: Add your BotFather token to `.env` (`TELEGRAM_BOT_TOKEN=...`).
-2. **Start the Bot**: Run `npm run dev`. You should see:
-   ```text
-   Connecting to Telegram Bot API...
-   Telegram Bot started successfully as @YourBotName (ID: 123456789)
-   Bot is ready to receive /start and /help commands.
-   ```
-3. **Open Telegram**: Navigate to `https://t.me/<YourBotUsername>` or search for your bot.
-4. **Test `/start`**: Send `/start`. The bot responds with the welcome message introducing the announcement system.
-5. **Test `/help`**: Send `/help`. The bot responds with the help message detailing the bot's purpose for final-project announcement distribution.
-6. **Test Graceful Shutdown**: Press `Ctrl+C` in your terminal. The bot safely terminates polling and exits cleanly.
-
-### Automated Unit Tests
-
-Run the test suite at any time:
 ```bash
 npm test
 ```
-The unit tests verify:
-- Safe environment parsing and missing variable detection.
-- Bot instance instantiation.
-- Token sanitization in error logs.
-- Command handler behavior for `/start` and `/help`.
+
+### Test Suites Breakdown
+
+| Test Suite | Purpose | Tests |
+| :--- | :--- | :---: |
+| `tests/integration_day2.test.ts` | Complete end-to-end integration and reliability verification | 18 |
+| `tests/distribution.test.ts` | Multi-destination distribution and isolation | 13 |
+| `tests/delivery_tracking.test.ts` | Database idempotency, PENDING claims, and crash recovery | 11 |
+| `tests/retry.test.ts` | Exponential backoff, optimistic locking, and background retries | 19 |
+| `tests/media_album.test.ts` | Debouncing, album collection ceiling, and media types | 27 |
+| `tests/forwarding.test.ts` | Native forwarding, error classification, and token sanitization | 21 |
+| `tests/destination.test.ts` | Destination group management, soft-deactivation, and commands | 14 |
+| `tests/source.test.ts` | Source registration and forum topic detection | 10 |
+| `tests/bot.test.ts` | Telegraf bot setup and error handling | 7 |
+| `tests/db.test.ts` | Prisma 7 PostgreSQL integration and cascades | 2 |
+| `tests/config.test.ts` | Environment configuration and token validation | 5 |
+| **Total** | | **162 passing** |
+
+### 2. Manual Live Telegram Testing Procedure
+To verify live in Telegram:
+1. Start the bot: `npm run dev`.
+2. In the course supergroup, enter a forum topic (e.g. "Final Project").
+3. Send: `/register_source Final Project`.
+4. Copy the returned `source_id`.
+5. In each student group, run: `/register_destination <source_id> Team Alpha`.
+6. Post a message in the source topic (text, photo, PDF, voice, or media album).
+7. Confirm that the message appears immediately in destination groups with native forwarding attribution.
+8. Check database records:
+   ```bash
+   psql -d announcement_db -c "SELECT * FROM \"ForwardingLog\" ORDER BY \"createdAt\" DESC LIMIT 5;"
+   ```
 
 ---
 
-## Security Considerations
+## 13. Known Limitations & Reliability Trade-offs
 
-- **No Hardcoded Tokens**: The bot token is loaded strictly from environment variables.
-- **Error Redaction**: All logged errors pass through `sanitizeError` to strip bot tokens or credentials from log streams.
-- **Git Safety**: `.env` is listed in `.gitignore` to prevent secret leaks to version control.
+1. **In-Memory Album Debounce Buffer**:
+   - Because Telegram does not provide an "album complete" event, album updates are accumulated in memory for 500ms before dispatching. If the bot crashes during this 500ms window, unforwarded album updates in memory are discarded until re-sent.
+2. **Sequential Loop for Destination Delivery**:
+   - Deliveries to destinations are executed sequentially with a 50ms polite pacing delay. For dozens of destination groups, this runs in under 1–2 seconds. For massive broadcasts across hundreds of groups, a distributed task queue (e.g. BullMQ / Redis) would provide concurrent sharding.
+3. **Distributed Two-Phase Commit Limitation**:
+   - External network calls cannot participate in a two-phase transaction with PostgreSQL. A crash occurring after Telegram accepts a message but before PostgreSQL commits `SUCCESS` can result in an at-least-once re-send upon crash recovery.
+
+---
+
+## 14. Security Considerations
+
+- **Zero Hardcoded Secrets**: All tokens and database credentials are strictly loaded via `.env`.
+- **Token Sanitization**: `sanitizeError` strips bot tokens from all console logs and database error messages.
+- **Admin Authorization**: Modifying sources or destinations requires explicit admin rights (`ADMIN_USER_IDS` or chat administrator privileges).
+- **Bot Loop Protection**: Messages from other bots and commands are excluded from distribution.
