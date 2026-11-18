@@ -18,12 +18,14 @@ model SourceGroup {
   chatId    BigInt
   topicId   BigInt
   name      String
+  isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
 
   destinationGroups DestinationGroup[]
 
   @@unique([chatId, topicId])
   @@index([chatId])
+  @@index([isActive])
 }
 
 model DestinationGroup {

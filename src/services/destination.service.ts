@@ -22,6 +22,11 @@ export interface UpdateDestinationStatusResult {
   destination?: DestinationWithSource;
 }
 
+export interface DeleteDestinationResult {
+  success: boolean;
+  message: string;
+}
+
 export class DestinationService {
   /**
    * Registers a Telegram destination group and associates it with a SourceGroup.
@@ -68,6 +73,14 @@ export class DestinationService {
           success: false,
           isNew: false,
           message: `Referenced source group with ID "${trimmedSourceId}" was not found. Please verify the source ID via /list_sources.`,
+        };
+      }
+
+      if (!source.isActive) {
+        return {
+          success: false,
+          isNew: false,
+          message: `Cannot register destination under inactive source topic "${source.name}". Reactivate it first using /activate_source ${source.id}.`,
         };
       }
 
@@ -164,6 +177,15 @@ export class DestinationService {
     }
 
     try {
+      // Check if source itself is active
+      const source = await prisma.sourceGroup.findUnique({
+        where: { id: trimmedId },
+      });
+
+      if (!source || !source.isActive) {
+        return [];
+      }
+
       return await prisma.destinationGroup.findMany({
         where: {
           sourceGroupId: trimmedId,
@@ -252,6 +274,64 @@ export class DestinationService {
       return {
         success: false,
         message: 'Database error occurred while updating destination status.',
+      };
+    }
+  }
+
+  /**
+   * Safe destination deletion:
+   * Prevents hard deletion if historical delivery logs exist to preserve audit history.
+   * Admins are instructed to deactivate instead.
+   */
+  async deleteDestination(id: string): Promise<DeleteDestinationResult> {
+    const trimmedId = id?.trim();
+    if (!trimmedId) {
+      return {
+        success: false,
+        message: 'Destination ID cannot be empty.',
+      };
+    }
+
+    try {
+      const existing = await prisma.destinationGroup.findUnique({
+        where: { id: trimmedId },
+      });
+
+      if (!existing) {
+        return {
+          success: false,
+          message: `Destination group with ID "${trimmedId}" was not found.`,
+        };
+      }
+
+      const logCount = await prisma.forwardingLog.count({
+        where: { destinationGroupId: trimmedId },
+      });
+
+      if (logCount > 0) {
+        return {
+          success: false,
+          message:
+            `Cannot delete destination "${existing.groupName}": ${logCount} historical forwarding log(s) exist. ` +
+            `To safely preserve delivery history, deactivate it using /remove_destination ${trimmedId}`,
+        };
+      }
+
+      await prisma.destinationGroup.delete({
+        where: { id: trimmedId },
+      });
+
+      console.log(`[DestinationService] Destination "${existing.groupName}" (${trimmedId}) deleted safely (0 forwarding logs existed).`);
+      return {
+        success: true,
+        message: `Destination group "${existing.groupName}" has been permanently deleted.`,
+      };
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[DestinationService Error] Failed to delete destination: ${errorMsg}`);
+      return {
+        success: false,
+        message: 'Database error occurred while deleting destination.',
       };
     }
   }

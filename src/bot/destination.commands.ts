@@ -1,7 +1,7 @@
 import { Telegraf } from 'telegraf';
-import { isAuthorizedAdmin } from './auth';
+import { isAuthorizedAdmin, denyUnauthorizedAccess } from './auth';
 import { destinationService } from '../services/destination.service';
-import { sanitizeError } from './bot';
+import { sanitizeError } from '../utils/sanitize';
 
 /**
  * Registers destination group management commands with the Telegraf bot.
@@ -12,8 +12,7 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
     try {
       const isAuth = await isAuthorizedAdmin(ctx);
       if (!isAuth) {
-        console.warn(`[Security Alert] Unauthorized /register_destination attempt by user ${ctx.from?.id} in chat ${ctx.chat?.id}`);
-        await ctx.reply('⛔ Access denied: You are not authorized to register destination groups.');
+        await denyUnauthorizedAccess(ctx, 'register destination groups');
         return;
       }
 
@@ -29,7 +28,7 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
 
       if (!rawArgs) {
         await ctx.reply(
-          'ℹ️ Usage:\n' +
+          'ℹ️ **Usage**:\n' +
           '`/register_destination <source_id> <group_name>`\n\n' +
           'Run this command inside the student destination group.\n' +
           'Tip: Use `/list_sources` to copy the source ID.'
@@ -64,26 +63,26 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
         const dest = result.destination;
         if (result.isNew) {
           await ctx.reply(
-            `✅ Destination Group Registered Successfully!\n\n` +
-            `👥 Group Name: ${dest.groupName}\n` +
-            `💬 Chat ID: ${dest.chatId}\n` +
-            `🆔 Destination ID: \`${dest.id}\`\n` +
-            `🔗 Source: ${dest.sourceGroup.name} (\`${dest.sourceGroupId}\`)\n` +
-            `🟢 Status: Active\n\n` +
+            `✅ **Destination Group Registered Successfully!**\n\n` +
+            `👥 **Group Name:** ${dest.groupName}\n` +
+            `💬 **Chat ID:** \`${dest.chatId}\`\n` +
+            `🆔 **Destination ID:** \`${dest.id}\`\n` +
+            `🔗 **Source:** ${dest.sourceGroup.name} (\`${dest.sourceGroupId}\`)\n` +
+            `🟢 **Status:** Active\n\n` +
             `Note: Ensure the bot is added as an administrator or granted permission to send messages here.`
           );
         } else {
           await ctx.reply(
-            `ℹ️ Destination Group Already Registered:\n\n` +
-            `👥 Group Name: ${dest.groupName}\n` +
-            `💬 Chat ID: ${dest.chatId}\n` +
-            `🆔 Destination ID: \`${dest.id}\`\n` +
-            `🔗 Source: ${dest.sourceGroup.name}\n` +
+            `ℹ️ **Destination Group Already Registered**:\n\n` +
+            `👥 **Group Name:** ${dest.groupName}\n` +
+            `💬 **Chat ID:** \`${dest.chatId}\`\n` +
+            `🆔 **Destination ID:** \`${dest.id}\`\n` +
+            `🔗 **Source:** ${dest.sourceGroup.name}\n` +
             `Status: ${dest.isActive ? '🟢 Active' : '🔴 Inactive'}`
           );
         }
       } else {
-        await ctx.reply(`❌ Registration Failed: ${result.message}`);
+        await ctx.reply(`❌ **Registration Failed**: ${result.message}`);
       }
     } catch (err) {
       console.error('[Telegram Bot] Error in /register_destination:', sanitizeError(err, token));
@@ -96,8 +95,7 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
     try {
       const isAuth = await isAuthorizedAdmin(ctx);
       if (!isAuth) {
-        console.warn(`[Security Alert] Unauthorized /list_destinations attempt by user ${ctx.from?.id}`);
-        await ctx.reply('⛔ Access denied: You are not authorized to view destination groups.');
+        await denyUnauthorizedAccess(ctx, 'view destination groups');
         return;
       }
 
@@ -122,16 +120,18 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
         return;
       }
 
-      let response = `📋 Registered Destination Groups (${destinations.length}):\n\n`;
+      let response = `📋 **Registered Destination Groups (${destinations.length})**:\n\n`;
       for (const dest of destinations) {
         const statusIcon = dest.isActive ? '🟢 Active' : '🔴 Inactive';
         response +=
-          `• ${dest.groupName}\n` +
+          `• **${dest.groupName}**\n` +
           `  Status: ${statusIcon}\n` +
-          `  Chat ID: ${dest.chatId}\n` +
-          `  Destination ID: ${dest.id}\n` +
-          `  Source: ${dest.sourceGroup.name} (${dest.sourceGroupId})\n\n`;
+          `  Destination ID: \`${dest.id}\`\n` +
+          `  Chat ID: \`${dest.chatId}\`\n` +
+          `  Source: ${dest.sourceGroup.name} (\`${dest.sourceGroupId}\`)\n\n`;
       }
+
+      response += '💡 Use `/remove_destination <id>` to deactivate or `/activate_destination <id>` to reactivate.';
 
       await ctx.reply(response);
     } catch (err) {
@@ -140,38 +140,54 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
     }
   });
 
-  // /remove_destination <destination_id> (Deactivates instead of deleting)
+  // /remove_destination <destination_id> [--force]
   bot.command('remove_destination', async (ctx) => {
     try {
       const isAuth = await isAuthorizedAdmin(ctx);
       if (!isAuth) {
-        console.warn(`[Security Alert] Unauthorized /remove_destination attempt by user ${ctx.from?.id}`);
-        await ctx.reply('⛔ Access denied: You are not authorized to deactivate destination groups.');
+        await denyUnauthorizedAccess(ctx, 'remove or deactivate destination groups');
         return;
       }
 
       const text = 'text' in ctx.message ? ctx.message.text : '';
       const rawArgs = text.replace(/^\/remove_destination(@\w+)?\s*/, '').trim();
-      const destinationId = rawArgs.split(/\s+/)[0];
+      const parts = rawArgs.split(/\s+/);
+      const destinationId = parts[0];
+      const isForce = parts.includes('--force');
 
       if (!destinationId) {
         await ctx.reply(
-          'ℹ️ Usage:\n' +
-          '`/remove_destination <destination_id>`\n\n' +
+          'ℹ️ **Usage**:\n' +
+          '• Soft deactivation (recommended): `/remove_destination <destination_id>`\n' +
+          '• Permanent deletion (only if no logs exist): `/remove_destination <destination_id> --force`\n\n' +
           'Tip: Use `/list_destinations` to find the destination ID.'
         );
         return;
       }
 
+      if (isForce) {
+        // Attempt hard deletion (guarded against foreign key / log loss)
+        const deleteResult = await destinationService.deleteDestination(destinationId);
+        if (deleteResult.success) {
+          await ctx.reply(`🗑️ **Destination Deleted Successfully!**\n\nDestination ID: \`${destinationId}\``);
+        } else {
+          await ctx.reply(`❌ **Cannot Delete Destination**:\n${deleteResult.message}`);
+        }
+        return;
+      }
+
+      // Safe soft deactivation (default behavior preserving all delivery logs)
       const result = await destinationService.setDestinationStatus(destinationId, false);
 
       if (result.success && result.destination) {
         await ctx.reply(
-          `🛑 Destination Deactivated Successfully:\n\n` +
-          `👥 Group: ${result.destination.groupName}\n` +
-          `🆔 Destination ID: \`${result.destination.id}\`\n` +
-          `🔗 Source: ${result.destination.sourceGroup.name}\n` +
-          `🔴 Status: Inactive (Delivery history retained. Use /activate_destination to resume).`
+          `🛑 **Destination Deactivated Successfully!**\n\n` +
+          `👥 **Group:** ${result.destination.groupName}\n` +
+          `🆔 **Destination ID:** \`${result.destination.id}\`\n` +
+          `🔗 **Source:** ${result.destination.sourceGroup.name}\n` +
+          `🔴 **Status:** Inactive\n\n` +
+          `🛡️ _Historical delivery logs are safely preserved._\n` +
+          `_Use \`/activate_destination ${result.destination.id}\` to resume announcements at any time._`
         );
       } else {
         await ctx.reply(`❌ Failed to deactivate destination: ${result.message}`);
@@ -187,8 +203,7 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
     try {
       const isAuth = await isAuthorizedAdmin(ctx);
       if (!isAuth) {
-        console.warn(`[Security Alert] Unauthorized /activate_destination attempt by user ${ctx.from?.id}`);
-        await ctx.reply('⛔ Access denied: You are not authorized to activate destination groups.');
+        await denyUnauthorizedAccess(ctx, 'activate destination groups');
         return;
       }
 
@@ -198,9 +213,7 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
 
       if (!destinationId) {
         await ctx.reply(
-          'ℹ️ Usage:\n' +
-          '`/activate_destination <destination_id>`\n\n' +
-          'Tip: Use `/list_destinations` to find the destination ID.'
+          'ℹ️ **Usage**: `/activate_destination <destination_id>`\n\nTip: Use `/list_destinations` to find the destination ID.'
         );
         return;
       }
@@ -209,11 +222,11 @@ export function registerDestinationCommands(bot: Telegraf, token?: string): void
 
       if (result.success && result.destination) {
         await ctx.reply(
-          `🟢 Destination Reactivated Successfully:\n\n` +
-          `👥 Group: ${result.destination.groupName}\n` +
-          `🆔 Destination ID: \`${result.destination.id}\`\n` +
-          `🔗 Source: ${result.destination.sourceGroup.name}\n` +
-          `🟢 Status: Active (Ready to receive announcements).`
+          `🟢 **Destination Reactivated Successfully!**\n\n` +
+          `👥 **Group:** ${result.destination.groupName}\n` +
+          `🆔 **Destination ID:** \`${result.destination.id}\`\n` +
+          `🔗 **Source:** ${result.destination.sourceGroup.name}\n` +
+          `🟢 **Status:** Active (Ready to receive announcements).`
         );
       } else {
         await ctx.reply(`❌ Failed to reactivate destination: ${result.message}`);

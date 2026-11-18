@@ -1,6 +1,7 @@
 import { Context } from 'telegraf';
 import { SourceGroup } from '@prisma/client';
 import { sourceService } from '../services/source.service';
+import { logger } from '../utils/logger';
 
 export interface DetectedAnnouncement {
   sourceGroup: SourceGroup;
@@ -80,9 +81,33 @@ export async function detectSourceAnnouncement(ctx: Context): Promise<DetectedAn
     return null;
   }
 
+  // 4b. Ignore messages from inactive sources
+  if (!sourceGroup.isActive) {
+    logger.info(`Ignored message in deactivated source "${sourceGroup.name}"`, {
+      event: 'announcement.ignored_inactive',
+      sourceChatId: chat.id,
+      sourceTopicId: topicId,
+      sourceMessageId: message.message_id,
+    });
+    console.log(
+      `[SourceDetector] ⏸️ Ignored message in deactivated source "${sourceGroup.name}" ` +
+      `(Chat: ${chat.id}, Topic: ${topicId}, Message: #${message.message_id})`
+    );
+    return null;
+  }
+
   // 5. Source matched! Extract message metadata
   const { contentType, hasMedia, preview } = getMessageContentType(message);
   const mediaGroupId = (message as any).media_group_id ? String((message as any).media_group_id) : undefined;
+
+  logger.info(`Recognized announcement in registered source "${sourceGroup.name}"`, {
+    event: 'announcement.detected',
+    sourceChatId: chat.id,
+    sourceTopicId: topicId,
+    sourceMessageId: message.message_id,
+    contentType,
+    mediaGroupId,
+  });
 
   console.log(
     `[SourceDetector] 📢 Recognized announcement in registered source "${sourceGroup.name}" ` +

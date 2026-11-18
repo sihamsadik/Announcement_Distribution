@@ -8,6 +8,9 @@ export interface AppConfig {
   databaseUrl?: string;
   adminUserIds: number[];
   nodeEnv: string;
+  healthPort: number;
+  logLevel: 'debug' | 'info' | 'warn' | 'error';
+  logFormat: 'json' | 'text';
 }
 
 export function parseAdminUserIds(raw?: string): number[] {
@@ -56,10 +59,27 @@ export function loadConfig(): AppConfig {
     );
   }
 
+  const rawPort = parseInt(process.env.HEALTH_PORT || process.env.PORT || '3000', 10);
+  const healthPort = isNaN(rawPort) || rawPort <= 0 || rawPort > 65535 ? 3000 : rawPort;
+
+  const validLogLevels = ['debug', 'info', 'warn', 'error'] as const;
+  const rawLogLevel = (process.env.LOG_LEVEL || '').toLowerCase();
+  const logLevel = validLogLevels.includes(rawLogLevel as any)
+    ? (rawLogLevel as 'debug' | 'info' | 'warn' | 'error')
+    : process.env.NODE_ENV === 'test' ? 'error' : 'info';
+
+  const logFormat: 'json' | 'text' =
+    process.env.LOG_FORMAT === 'json' || process.env.NODE_ENV === 'production'
+      ? 'json'
+      : 'text';
+
   return {
     telegramBotToken: token,
     databaseUrl: process.env.DATABASE_URL?.trim(),
     adminUserIds: getAdminUserIds(),
     nodeEnv: process.env.NODE_ENV || 'development',
+    healthPort,
+    logLevel,
+    logFormat,
   };
 }

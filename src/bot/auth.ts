@@ -37,3 +37,16 @@ export async function isAuthorizedAdmin(ctx: Context): Promise<boolean> {
 
   return false;
 }
+
+/**
+ * Standardized security warning and rejection handler for unauthorized access attempts.
+ */
+export async function denyUnauthorizedAccess(
+  ctx: Context,
+  actionDescription: string
+): Promise<void> {
+  const userId = ctx.from?.id ?? 'unknown';
+  const chatId = ctx.chat?.id ?? 'unknown';
+  console.warn(`[Security Alert] Unauthorized ${actionDescription} attempt by user ${userId} in chat ${chatId}`);
+  await ctx.reply(`⛔ Access denied: You are not authorized to ${actionDescription}.`);
+}

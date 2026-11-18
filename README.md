@@ -163,6 +163,7 @@ erDiagram
         bigint chatId "Telegram Group Chat ID"
         bigint topicId "Forum Topic Thread ID"
         string name "Human Readable Name"
+        boolean isActive "Active Toggle"
         datetime createdAt
     }
 
@@ -349,9 +350,70 @@ INITIAL_RETRY_DELAY_SECONDS=5
 MAX_RETRY_DELAY_SECONDS=300
 RETRY_POLL_INTERVAL_MS=10000
 
+# Health Check & Monitoring Server (Optional defaults shown)
+HEALTH_PORT=3000
+
+# Structured Logging Configuration (Optional)
+LOG_LEVEL="info"         # "debug", "info", "warn", or "error"
+LOG_FORMAT="text"        # "text" for development, "json" for production
+
 # Application Environment
 NODE_ENV="development"
 ```
+
+---
+
+## 10. System Health Checks & HTTP Endpoints
+
+The service runs a lightweight, non-blocking HTTP health check server using Node.js's standard `http` library on `HEALTH_PORT` (default: `3000`):
+
+### 1. Liveness Probe (`GET /health` or `GET /health/live`)
+- **Purpose**: Verifies that the Node.js process is active and has completed initialization.
+- **Status Code**: `200 OK` (or `503 Service Unavailable` if shutting down).
+- **Example Response**:
+  ```json
+  {
+    "status": "ok",
+    "uptimeSeconds": 142,
+    "isInitialized": true,
+    "isShuttingDown": false,
+    "timestamp": "2026-11-18T05:30:00.000Z"
+  }
+  ```
+
+### 2. Readiness Probe (`GET /health/ready`)
+- **Purpose**: Verifies that both PostgreSQL and Telegram Bot API connectivity are active.
+- **Status Code**: `200 OK` if all dependencies are healthy; `503 Service Unavailable` if either fails.
+- **Example Response (Healthy)**:
+  ```json
+  {
+    "status": "ready",
+    "uptimeSeconds": 142,
+    "timestamp": "2026-11-18T05:30:00.000Z",
+    "checks": {
+      "app": { "status": "healthy", "uptimeSeconds": 142, "isInitialized": true, "isShuttingDown": false },
+      "database": { "status": "healthy", "latencyMs": 3, "details": { "reachable": true } },
+      "telegram": { "status": "healthy", "latencyMs": 95, "details": { "botId": 123456789, "username": "MyAnnouncementBot" } }
+    }
+  }
+  ```
+
+---
+
+## 11. Structured Logging & Error Monitoring
+
+The system implements a centralized structured logger (`src/utils/logger.ts`) supporting standard log levels (`debug`, `info`, `warn`, `error`) and dual output formats:
+
+- **Development Mode (`LOG_FORMAT=text`)**: Human-readable, bracketed console logs:
+  ```text
+  [2026-11-18T05:30:00.000Z] [INFO] [announcement.detected] Recognized announcement in registered source "Final Project" {"sourceChatId":"-100123","sourceMessageId":42}
+  ```
+- **Production Mode (`LOG_FORMAT=json`)**: Single-line JSON events for ingest into monitoring collectors (Datadog, CloudWatch, Loki):
+  ```json
+  {"timestamp":"2026-11-18T05:30:00.000Z","level":"INFO","message":"Forwarding completed successfully","event":"forwarding.succeeded","sourceChatId":"-100123","sourceMessageId":42,"destinationChatId":"-100456"}
+  ```
+- **Security & Redaction**: Automatically scrubs Telegram bot tokens (`[REDACTED_BOT_TOKEN]`) and database URLs with credentials (`[REDACTED_DATABASE_URL]`) from all messages and error stacks.
+
 
 ---
 
@@ -360,14 +422,21 @@ NODE_ENV="development"
 | Command | Usage | Description | Access |
 | :--- | :--- | :--- | :--- |
 | `/start` | `/start` | Bot welcome message | Public |
-| `/help` | `/help` | Help documentation and instructions | Public |
+| `/help` | `/help` | Complete command reference manual | Public |
 | `/register_source` | `/register_source [topicId] <name>` | Registers forum topic as an announcement source | Admins Only |
-| `/list_sources` | `/list_sources` | Lists all registered announcement sources | Admins Only |
+| `/list_sources` | `/list_sources` | Lists all registered announcement sources with status & destination counts | Admins Only |
+| `/source_details` | `/source_details <source_id>` | Detailed source inspection: destinations, status, and delivery metrics | Admins Only |
+| `/remove_source` | `/remove_source <source_id> [--force]` | Soft-deactivates source (`isActive: false`, guarded deletion with `--force`) | Admins Only |
+| `/activate_source` | `/activate_source <source_id>` | Reactivates a deactivated source topic (`isActive: true`) | Admins Only |
 | `/register_destination` | `/register_destination <source_id> <name>` | Registers student group under a source topic | Admins Only |
-| `/list_destinations` | `/list_destinations [source_id]` | Lists registered destinations | Admins Only |
-| `/remove_destination` | `/remove_destination <dest_id>` | Soft-deactivates destination (`isActive: false`) | Admins Only |
+| `/list_destinations` | `/list_destinations [source_id]` | Lists registered destinations (optionally filtered by source) | Admins Only |
+| `/remove_destination` | `/remove_destination <dest_id> [--force]` | Soft-deactivates destination (`isActive: false`, guarded deletion with `--force`) | Admins Only |
 | `/activate_destination`| `/activate_destination <dest_id>` | Reactivates destination (`isActive: true`) | Admins Only |
-| `/test_forward` | `/test_forward <dest_chat_id> [msg_id]` | Tests forwarding a single message | Admins Only |
+| `/delivery_stats` | `/delivery_stats [source_id_or_timeframe] [timeframe]` | In-chat delivery metrics, success/failure rates, retry totals, and timeframe filters | Admins Only |
+| `/recent_deliveries` | `/recent_deliveries [limit]` | Lists recent delivery attempts across destinations (default 10, max 50) | Admins Only |
+| `/failed_deliveries` | `/failed_deliveries [limit]` | Lists failed or retrying delivery attempts with sanitized errors | Admins Only |
+| `/delivery_details` | `/delivery_details <log_id>` | Full inspection of a specific delivery log, timestamps, and error traces | Admins Only |
+| `/test_forward` | `/test_forward <dest_chat_id> [msg_id]` | Tests forwarding a single message directly to a destination | Admins Only |
 
 ---
 
@@ -414,7 +483,7 @@ npm start
 ## 12. Verification & Testing
 
 ### 1. Automated Test Suite (Jest)
-The test suite consists of 11 comprehensive suites and 162 unit & integration tests covering all system aspects:
+The test suite consists of 13 comprehensive suites and 207 unit & integration tests covering all system aspects:
 
 ```bash
 npm test
@@ -424,6 +493,8 @@ npm test
 
 | Test Suite | Purpose | Tests |
 | :--- | :--- | :---: |
+| `tests/day3_stats_logging_health.test.ts`| Distribution statistics, structured logging, sanitization, and HTTP health checks | 20 |
+| `tests/day3_admin_monitoring.test.ts` | Admin auth security, source/dest lifecycle, deactivation, and in-chat monitoring | 25 |
 | `tests/integration_day2.test.ts` | Complete end-to-end integration and reliability verification | 18 |
 | `tests/distribution.test.ts` | Multi-destination distribution and isolation | 13 |
 | `tests/delivery_tracking.test.ts` | Database idempotency, PENDING claims, and crash recovery | 11 |
@@ -435,7 +506,7 @@ npm test
 | `tests/bot.test.ts` | Telegraf bot setup and error handling | 7 |
 | `tests/db.test.ts` | Prisma 7 PostgreSQL integration and cascades | 2 |
 | `tests/config.test.ts` | Environment configuration and token validation | 5 |
-| **Total** | | **162 passing** |
+| **Total** | | **207 passing** |
 
 ### 2. Manual Live Telegram Testing Procedure
 To verify live in Telegram:
