@@ -4,6 +4,7 @@ import { registerSourceCommands } from './source.commands';
 import { registerDestinationCommands } from './destination.commands';
 import { registerForwardingCommands } from './forwarding.commands';
 import { registerMonitoringCommands } from './monitoring.commands';
+import { registerDeadlineCommands } from './deadline.commands';
 import { distributionService } from '../services/distribution.service';
 import { sanitizeError } from '../utils/sanitize';
 
@@ -43,6 +44,9 @@ export function setupBotHandlers(bot: Telegraf, token?: string): void {
 
   // Register destination management commands (/register_destination, /list_destinations, /remove_destination, /activate_destination)
   registerDestinationCommands(bot, token);
+
+  // Register deadline and reminder calendar commands (/add_deadline, /deadlines, /deadline_details, /cancel_deadline, /delete_deadline)
+  registerDeadlineCommands(bot, token);
 
   // Register message forwarding test command (/test_forward)
   registerForwardingCommands(bot, token);

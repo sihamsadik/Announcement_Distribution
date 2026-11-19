@@ -13,6 +13,24 @@ enum ForwardingStatus {
   FAILED
 }
 
+enum DeadlineStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum ReminderType {
+  REMINDER_24_HOUR
+  ADDITIONAL
+}
+
+enum DeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  EXPIRED
+}
+
 model SourceGroup {
   id        String   @id @default(uuid())
   chatId    BigInt
@@ -22,6 +40,7 @@ model SourceGroup {
   createdAt DateTime @default(now())
 
   destinationGroups DestinationGroup[]
+  deadlines          Deadline[]
 
   @@unique([chatId, topicId])
   @@index([chatId])
@@ -36,8 +55,10 @@ model DestinationGroup {
   isActive      Boolean     @default(true)
   createdAt     DateTime    @default(now())
 
-  sourceGroup    SourceGroup     @relation(fields: [sourceGroupId], references: [id], onDelete: Cascade)
-  forwardingLogs ForwardingLog[]
+  sourceGroup           SourceGroup                @relation(fields: [sourceGroupId], references: [id], onDelete: Cascade)
+  forwardingLogs        ForwardingLog[]
+  deadlineAnnouncements DeadlineAnnouncement[]
+  deadlineReminders     DeadlineReminderDelivery[]
 
   @@unique([sourceGroupId, chatId])
   @@index([chatId])
@@ -65,4 +86,68 @@ model ForwardingLog {
   @@index([createdAt])
   @@index([sourceChatId, sourceMessageId])
   @@index([status, nextRetryAt])
+}
+
+model Deadline {
+  id                   String                     @id @default(uuid())
+  sourceGroupId        String
+  title                String
+  description          String
+  dueAt                DateTime
+  timezone             String                     @default("Africa/Addis_Ababa")
+  status               DeadlineStatus             @default(ACTIVE)
+  additionalReminderAt DateTime?
+  createdBy            BigInt
+  createdAt            DateTime                   @default(now())
+  updatedAt            DateTime                   @updatedAt @default(now())
+
+  sourceGroup          SourceGroup                @relation(fields: [sourceGroupId], references: [id], onDelete: Restrict)
+  announcements        DeadlineAnnouncement[]
+  reminderDeliveries   DeadlineReminderDelivery[]
+
+  @@index([sourceGroupId])
+  @@index([status, dueAt])
+}
+
+model DeadlineAnnouncement {
+  id                 String           @id @default(uuid())
+  deadlineId         String
+  destinationGroupId String
+  telegramMessageId  Int?
+  isPinned           Boolean          @default(false)
+  pinErrorMessage    String?
+  status             DeliveryStatus   @default(PENDING)
+  errorMessage       String?
+  sentAt             DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt @default(now())
+
+  deadline           Deadline         @relation(fields: [deadlineId], references: [id], onDelete: Cascade)
+  destinationGroup   DestinationGroup @relation(fields: [destinationGroupId], references: [id], onDelete: Restrict)
+
+  @@unique([deadlineId, destinationGroupId])
+  @@index([deadlineId])
+  @@index([destinationGroupId])
+}
+
+model DeadlineReminderDelivery {
+  id                 String           @id @default(uuid())
+  deadlineId         String
+  destinationGroupId String
+  reminderType       ReminderType
+  status             DeliveryStatus   @default(PENDING)
+  telegramMessageId  Int?
+  errorMessage       String?
+  scheduledFor       DateTime
+  sentAt             DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt @default(now())
+
+  deadline           Deadline         @relation(fields: [deadlineId], references: [id], onDelete: Cascade)
+  destinationGroup   DestinationGroup @relation(fields: [destinationGroupId], references: [id], onDelete: Restrict)
+
+  @@unique([deadlineId, destinationGroupId, reminderType])
+  @@index([deadlineId])
+  @@index([destinationGroupId])
+  @@index([status, scheduledFor])
 }

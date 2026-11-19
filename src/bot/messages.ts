@@ -20,6 +20,12 @@ export const BOT_MESSAGES = {
     '• `/list_destinations [source_id]` - List registered destinations (optionally filtered by source)\n' +
     '• `/remove_destination <dest_id> [--force]` - Deactivate a destination (or force delete if no logs)\n' +
     '• `/activate_destination <dest_id>` - Reactivate a deactivated destination\n\n' +
+    '📅 **Deadline Management & Reminders (Admins only):**\n' +
+    '• `/add_deadline` - Create submission deadline, publish, and pin announcement in student groups\n' +
+    '• `/deadlines` - List upcoming submission deadlines\n' +
+    '• `/deadline_details <deadline_id>` - View comprehensive deadline info, pin status, and reminders\n' +
+    '• `/cancel_deadline <deadline_id>` - Cancel deadline and expire future scheduled reminders\n' +
+    '• `/delete_deadline <deadline_id>` - Safely delete deadline (preserves historical delivery records)\n\n' +
     '📊 **Delivery Monitoring (Admins only):**\n' +
     '• `/delivery_stats [source_id]` - Summary of delivery metrics, success rate, and active counts\n' +
     '• `/recent_deliveries [limit]` - Inspect recent delivery attempts across destinations\n' +

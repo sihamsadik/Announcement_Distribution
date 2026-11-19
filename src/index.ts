@@ -2,6 +2,7 @@ import { loadConfig } from './config/env';
 import { createBot, sanitizeError } from './bot/bot';
 import { checkDatabaseConnection, disconnectPrisma } from './db/prisma';
 import { retryService } from './services/retry.service';
+import { deadlineSchedulerService } from './services/deadline-scheduler.service';
 import { distributionService } from './services/distribution.service';
 import { albumService } from './services/album.service';
 import { healthService } from './services/health.service';
@@ -106,8 +107,9 @@ async function main(): Promise<void> {
           logger.warn('Error stopping bot polling', { error: botErr });
         }
 
-        // Step 3: Stop scheduling background retries
+        // Step 3: Stop scheduling background retries & deadline reminders
         retryService.stopPolling();
+        deadlineSchedulerService.stopPolling();
 
         // Step 4: Flush any pending media albums buffered in memory
         try {
@@ -185,6 +187,10 @@ async function main(): Promise<void> {
     // 7. Start background retry polling
     retryService.startPolling(bot.telegram, token);
     logger.info('Retry worker polling active', { event: 'retry.worker_started' });
+
+    // 8. Start background deadline reminder scheduler polling
+    deadlineSchedulerService.startPolling(bot.telegram, token);
+    logger.info('Deadline reminder scheduler polling active', { event: 'deadline.scheduler_started' });
 
     // Mark system as fully initialized and ready
     healthService.markInitialized();

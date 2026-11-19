@@ -16,10 +16,13 @@ A robust, enterprise-grade Telegram bot service built with **Node.js**, **TypeSc
 - [8. Telegram Group Permissions & Privacy Mode](#8-telegram-group-permissions--privacy-mode)
 - [9. Environment Configuration](#9-environment-configuration)
 - [10. Bot Commands Reference](#10-bot-commands-reference)
-- [11. Installation, Build & Startup](#11-installation-build--startup)
-- [12. Verification & Testing](#12-verification--testing)
-- [13. Known Limitations & Reliability Trade-offs](#13-known-limitations--reliability-trade-offs)
-- [14. Security Considerations](#14-security-considerations)
+- [11. Deadline Calendar, Scheduled Reminders & Pinned Messages](#11-deadline-calendar-scheduled-reminders--pinned-messages)
+- [12. Installation, Build & Startup](#12-installation-build--startup)
+- [13. Verification & Testing](#13-verification--testing)
+- [14. Known Limitations & Reliability Trade-offs](#14-known-limitations--reliability-trade-offs)
+- [15. Security Hardening, Input Validation & Authorization Review](#15-security-hardening-input-validation--authorization-review)
+- [16. Performance Optimization](#16-performance-optimization)
+- [17. Graceful Shutdown & Startup Recovery](#17-graceful-shutdown--startup-recovery)
 
 ---
 
@@ -432,6 +435,11 @@ The system implements a centralized structured logger (`src/utils/logger.ts`) su
 | `/list_destinations` | `/list_destinations [source_id]` | Lists registered destinations (optionally filtered by source) | Admins Only |
 | `/remove_destination` | `/remove_destination <dest_id> [--force]` | Soft-deactivates destination (`isActive: false`, guarded deletion with `--force`) | Admins Only |
 | `/activate_destination`| `/activate_destination <dest_id>` | Reactivates destination (`isActive: true`) | Admins Only |
+| `/add_deadline` | `/add_deadline` or `/add_deadline <args>` | Creates deadline, publishes announcement, and pins in groups | Admins Only |
+| `/deadlines` | `/deadlines` | Lists upcoming active submission deadlines with due time & status | Admins Only |
+| `/deadline_details` | `/deadline_details <id>` | Comprehensive deadline inspection: pin status, delivery metrics, reminders | Admins Only |
+| `/cancel_deadline` | `/cancel_deadline <id>` | Cancels deadline and marks pending scheduled reminders as expired | Admins Only |
+| `/delete_deadline` | `/delete_deadline <id>` | Deletes deadline only when safe (preserves historical delivery records) | Admins Only |
 | `/delivery_stats` | `/delivery_stats [source_id_or_timeframe] [timeframe]` | In-chat delivery metrics, success/failure rates, retry totals, and timeframe filters | Admins Only |
 | `/recent_deliveries` | `/recent_deliveries [limit]` | Lists recent delivery attempts across destinations (default 10, max 50) | Admins Only |
 | `/failed_deliveries` | `/failed_deliveries [limit]` | Lists failed or retrying delivery attempts with sanitized errors | Admins Only |
@@ -440,7 +448,86 @@ The system implements a centralized structured logger (`src/utils/logger.ts`) su
 
 ---
 
-## 11. Installation, Build & Startup
+## 11. Deadline Calendar, Scheduled Reminders & Pinned Messages
+
+### 1. Overview
+The Deadline Management feature allows administrators to schedule project and assignment deadlines associated with registered source forum topics. When a deadline is created:
+1. The bot dispatches a formatted deadline announcement to all active destination groups linked to that source topic.
+2. The announcement message is automatically pinned inside each student destination group.
+3. Persistent reminder jobs are staged in PostgreSQL and automatically sent as the deadline approaches.
+
+### 2. How to Create a Deadline
+Administrators can create deadlines using either an interactive conversational wizard or a single-line command:
+
+#### A. Interactive Multi-Step Wizard
+Simply send:
+```text
+/add_deadline
+```
+The bot guides you through 7 interactive steps:
+1. **Source Topic Selection**: Choose from active registered course source topics by index or UUID.
+2. **Title**: Name of the submission deadline (3–200 characters).
+3. **Description**: Clear submission instructions, required files, format requirements, or portal links.
+4. **Submission Date**: `YYYY-MM-DD` (e.g. `2026-11-20`).
+5. **Submission Time**: `HH:MM` in 24-hour format (e.g. `23:59`).
+6. **Time Zone**: IANA timezone identifier (default: `Africa/Addis_Ababa`). Enter `default` or specify a zone like `UTC` or `America/New_York`.
+7. **Optional Additional Reminder**: Offset (e.g. `2h`, `1h`, `30m`) or `none`.
+
+To abort the interactive wizard at any time, send `/cancel`.
+
+#### B. Single-Line Command Syntax
+```text
+/add_deadline <SourceID> | <Title> | <YYYY-MM-DD> <HH:MM> | [Timezone] | [AdditionalReminder] | <Description>
+```
+*Example:*
+```text
+/add_deadline 9a38ef... | Final Project Submission | 2026-11-20 23:59 | Africa/Addis_Ababa | 2h | Submit GitHub repository link and PDF report on LMS.
+```
+
+### 3. How the Reminder Schedule Works
+- **Default 24-Hour Reminder**: Sent **exactly 24 hours** prior to the deadline (`dueAt - 24 hours`) to every active student destination group.
+  - Explains the deadline, due time in the configured timezone, and dynamic time remaining.
+  - Students opening Telegram on the day of or morning before will see the reminder waiting in their group.
+- **Optional Additional Reminder**: An administrator can configure a secondary reminder (e.g. `2h` or `1h` before deadline). If none is configured (`none`), only the 24-hour reminder is sent.
+- **Deadline Expiration**: Once the deadline passes (`now >= dueAt`), the deadline status transitions to `COMPLETED`. **No reminders are ever sent after a deadline has passed.**
+
+### 4. Time Zone Interpretation
+- All deadline dates and times are validated using JavaScript native `Intl.DateTimeFormat` against standard IANA timezones.
+- Default: `Africa/Addis_Ababa` (UTC+3).
+- Relative offsets (e.g. 24h, 2h) and dynamic time remaining calculations are computed against absolute UTC timestamps without drift.
+
+### 5. Pinned Deadline Messages & Group Permissions
+When a deadline announcement is sent:
+- The bot calls Telegram's `pinChatMessage` API inside each student destination group.
+- **Required Telegram Permissions**:
+  - `can_post_messages` (or standard member send rights).
+  - `can_pin_messages` (bot must be granted administrator privileges with the "Pin Messages" right).
+- **Graceful Permission Degradation**:
+  - If message delivery succeeds but pinning fails (e.g. Bot lacks the `can_pin_messages` right in a destination group), the send is recorded as `SUCCESS`, the pin failure is recorded separately (`isPinned: false`, with the Telegram error reason), and a warning is logged.
+  - **The bot will NOT re-send the announcement simply because pinning failed.**
+
+### 6. Persistent Scheduling & Offline Crash Recovery
+- Reminders are tracked persistently in PostgreSQL (`DeadlineReminderDelivery` table) and survive application restarts.
+- **Polling Worker**: `DeadlineSchedulerService` polls every 30 seconds for due `PENDING` reminders.
+- **Concurrency Safety**: Uses optimistic locking (`updateMany` with `status: PENDING` and `updatedAt`) combined with in-flight set deduplication, ensuring that multiple workers or overlapping scheduler ticks never process the same reminder twice.
+- **Late-Delivery Grace Period**:
+  - If the bot application was offline when a reminder became due, it recovers upon restart.
+  - If the reminder is within the 2-hour grace period and the deadline has not passed, it is dispatched immediately.
+  - If the deadline has already passed or the reminder is older than the 2-hour grace period, it is marked `EXPIRED` to prevent sending stale notifications to students.
+
+### 7. Listing, Cancelling, and Deleting Deadlines
+- `/deadlines`: Lists all upcoming active deadlines with their associated source topic, due date, destination group count, and reminder status.
+- `/deadline_details <id>`: Displays comprehensive information including pinned message status, reminder delivery counts (successful, failed, pending), and source topic metadata.
+- `/cancel_deadline <id>`: Safely transitions deadline status to `CANCELLED` and marks all pending reminders as `EXPIRED`.
+- `/delete_deadline <id>`: **Data Integrity Protection**: Permanently deletes a deadline ONLY if no announcements or reminders were ever delivered (`status === SUCCESS`). If delivery history exists, hard deletion is blocked to preserve audit integrity, prompting administrators to use `/cancel_deadline` instead.
+
+### 8. Telegram Bot API Limitations
+- **No Personal Chat Pinning**: Telegram Bot API only allows pinning messages inside groups, supergroups, and channels where the bot has administrator rights. Bots cannot pin entire chats in a user's personal Telegram home screen.
+- **No Individual Student Online State Detection**: Telegram Bot API does not provide presence/online state detection for group members. Reminders are posted directly to group chats so students see them upon opening Telegram.
+
+---
+
+## 12. Installation, Build & Startup
 
 ### 1. Prerequisites
 - **Node.js**: v18.x or v20.x LTS
@@ -493,6 +580,8 @@ npm test
 
 | Test Suite | Purpose | Tests |
 | :--- | :--- | :---: |
+| `tests/deadline.test.ts` | Deadline calendar, scheduling, pin permissions, 24h & additional reminders, isolation, and controllable clock | 21 |
+| `tests/deadline_commands.test.ts` | Bot commands (`/add_deadline`, `/deadlines`, `/cancel_deadline`), interactive conversational wizard, and authorization | 7 |
 | `tests/day4_tasks4_6_perf_recovery.test.ts` | Concurrency performance, graceful shutdown draining, album flushes, and crash recovery | 13 |
 | `tests/day4_security_validation.test.ts` | Security hardening, input validation, update eligibility, and authorization review | 25 |
 | `tests/day3_stats_logging_health.test.ts`| Distribution statistics, structured logging, sanitization, and HTTP health checks | 20 |
@@ -508,7 +597,7 @@ npm test
 | `tests/bot.test.ts` | Telegraf bot setup and error handling | 7 |
 | `tests/db.test.ts` | Prisma 7 PostgreSQL integration and cascades | 2 |
 | `tests/config.test.ts` | Environment configuration and token validation | 5 |
-| **Total** | | **245 passing** |
+| **Total** | | **273 passing** |
 
 ### 2. Manual Live Telegram Testing Procedure
 To verify live in Telegram:
