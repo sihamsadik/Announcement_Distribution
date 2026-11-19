@@ -2,6 +2,8 @@ import { loadConfig } from './config/env';
 import { createBot, sanitizeError } from './bot/bot';
 import { checkDatabaseConnection, disconnectPrisma } from './db/prisma';
 import { retryService } from './services/retry.service';
+import { distributionService } from './services/distribution.service';
+import { albumService } from './services/album.service';
 import { healthService } from './services/health.service';
 import { healthServer } from './server/health.server';
 import { logger } from './utils/logger';
@@ -64,7 +66,29 @@ async function main(): Promise<void> {
     }
 
     // 4. Setup graceful shutdown handlers
+    let isShuttingDown = false;
+    const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '10000', 10);
+
     const shutdown = async (signal: string) => {
+      if (isShuttingDown) {
+        logger.warn(`Shutdown already in progress, ignoring duplicate ${signal}`, {
+          event: 'app.shutdown_duplicate',
+          signal,
+        });
+        return;
+      }
+      isShuttingDown = true;
+
+      // Fail-safe force exit timer to prevent indefinite hanging
+      const forceExitTimer = setTimeout(() => {
+        logger.error(`Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms. Forcing process exit.`, {
+          event: 'app.shutdown_timeout',
+          timeoutMs: SHUTDOWN_TIMEOUT_MS,
+        });
+        process.exit(1);
+      }, SHUTDOWN_TIMEOUT_MS);
+      forceExitTimer.unref();
+
       healthService.markShuttingDown();
       logger.info(`Received ${signal}. Gracefully stopping application...`, {
         event: 'app.shutdown',
@@ -72,10 +96,48 @@ async function main(): Promise<void> {
       });
 
       try {
-        await healthServer.stop();
+        // Step 1: Reject new incoming messages/updates
+        distributionService.markShuttingDown();
+
+        // Step 2: Stop accepting new Telegram updates
+        try {
+          bot.stop(signal);
+        } catch (botErr) {
+          logger.warn('Error stopping bot polling', { error: botErr });
+        }
+
+        // Step 3: Stop scheduling background retries
         retryService.stopPolling();
-        bot.stop(signal);
+
+        // Step 4: Flush any pending media albums buffered in memory
+        try {
+          const flushedAlbums = await albumService.flushAll(bot.telegram, token);
+          if (flushedAlbums.length > 0) {
+            logger.info(`Flushed ${flushedAlbums.length} active media album(s) during shutdown.`, {
+              event: 'app.albums_flushed',
+              count: flushedAlbums.length,
+            });
+          }
+        } catch (albumErr) {
+          logger.warn('Error flushing albums during shutdown', { error: albumErr });
+        }
+
+        // Step 5: Allow in-progress distributions a reasonable window to finish
+        const drainTimeout = Math.min(5000, Math.max(1000, SHUTDOWN_TIMEOUT_MS - 3000));
+        const drained = await distributionService.drainActiveOperations(drainTimeout);
+        if (!drained) {
+          logger.warn('Some distribution operations were still in-flight when drain timeout elapsed.', {
+            activeRemaining: distributionService.getActiveOperationsCount(),
+          });
+        }
+
+        // Step 6: Stop HTTP health check server
+        await healthServer.stop().catch(() => {});
+
+        // Step 7: Disconnect PostgreSQL database cleanly
         await disconnectPrisma();
+
+        clearTimeout(forceExitTimer);
         logger.info('Bot stopped, health server closed, and database disconnected cleanly.', {
           event: 'app.stopped',
         });
@@ -104,7 +166,23 @@ async function main(): Promise<void> {
       event: 'bot.listening',
     });
 
-    // 6. Start background retry polling and run startup recovery
+    // 6. Startup Recovery: recover any stale PENDING deliveries from prior run/crash
+    logger.info('Running startup recovery for pending or interrupted deliveries...', {
+      event: 'startup.recovery_checking',
+    });
+    try {
+      const recoveredCount = await retryService.recoverStalePendingDeliveries();
+      if (recoveredCount > 0) {
+        logger.info(`Startup recovery complete: recovered ${recoveredCount} stale delivery record(s) for retry.`, {
+          event: 'startup.recovery_completed',
+          recoveredCount,
+        });
+      }
+    } catch (recErr) {
+      logger.warn('Error during startup recovery check', { error: recErr });
+    }
+
+    // 7. Start background retry polling
     retryService.startPolling(bot.telegram, token);
     logger.info('Retry worker polling active', { event: 'retry.worker_started' });
 

@@ -42,6 +42,9 @@ export class DistributionService {
   private readonly interDestinationDelayMs: number;
   private readonly maxBackoffMs: number;
   private readonly delivService: DeliveryService;
+  private readonly concurrency: number;
+  private activeOperations = 0;
+  private isShuttingDown = false;
 
   constructor(
     private readonly destService: DestinationService = destinationService,
@@ -49,7 +52,8 @@ export class DistributionService {
     private readonly albService: AlbumService = albumService,
     delivServiceOrDelay: DeliveryService | number = deliveryService,
     interDestinationDelayMs?: number,
-    maxBackoffMs = 10000
+    maxBackoffMs = 10000,
+    concurrency = parseInt(process.env.DISTRIBUTION_CONCURRENCY || '4', 10)
   ) {
     if (typeof delivServiceOrDelay === 'number') {
       this.delivService = deliveryService;
@@ -62,6 +66,7 @@ export class DistributionService {
         : (process.env.NODE_ENV === 'test' ? 0 : 50);
       this.maxBackoffMs = process.env.NODE_ENV === 'test' ? 10 : maxBackoffMs;
     }
+    this.concurrency = isNaN(concurrency) || concurrency < 1 ? 4 : concurrency;
 
     // Register this distribution service's album handler with the album service
     this.albService.setDefaultDistributionHandler(this.distributeAlbum.bind(this));
@@ -70,6 +75,57 @@ export class DistributionService {
   private sleep(ms: number): Promise<void> {
     if (ms <= 0) return Promise.resolve();
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  public markShuttingDown(): void {
+    this.isShuttingDown = true;
+  }
+
+  public getActiveOperationsCount(): number {
+    return this.activeOperations;
+  }
+
+  public getConcurrency(): number {
+    return this.concurrency;
+  }
+
+  public async drainActiveOperations(timeoutMs = 5000): Promise<boolean> {
+    const start = Date.now();
+    while (this.activeOperations > 0 && Date.now() - start < timeoutMs) {
+      await this.sleep(100);
+    }
+    return this.activeOperations === 0;
+  }
+
+  public resetStateForTesting(): void {
+    this.isShuttingDown = false;
+    this.activeOperations = 0;
+  }
+
+  /**
+   * Bounded concurrency runner: processes items with at most `limit` workers in parallel,
+   * preserving results in the original item index order.
+   */
+  private async runWithConcurrency<T, R>(
+    items: T[],
+    limit: number,
+    worker: (item: T, index: number) => Promise<R>
+  ): Promise<R[]> {
+    if (items.length === 0) return [];
+    const effectiveLimit = Math.max(1, Math.min(limit, items.length));
+    const results: R[] = new Array(items.length);
+    let nextIndex = 0;
+
+    const executeWorker = async () => {
+      while (nextIndex < items.length) {
+        const idx = nextIndex++;
+        results[idx] = await worker(items[idx], idx);
+      }
+    };
+
+    const workers = Array.from({ length: effectiveLimit }, () => executeWorker());
+    await Promise.all(workers);
+    return results;
   }
 
   /**
@@ -186,133 +242,152 @@ export class DistributionService {
     }
 
     console.log(
-      `[DistributionService] Distributing to ${activeDestinations.length} active destination group(s)...`
+      `[DistributionService] Distributing to ${activeDestinations.length} active destination group(s) ` +
+      `(Bounded concurrency: ${this.concurrency})...`
     );
 
-    // 2. Iterate through each active destination and forward the announcement
-    for (let i = 0; i < activeDestinations.length; i++) {
-      const destination = activeDestinations[i];
-      try {
-        // Step A: Idempotency & Concurrency Check via DeliveryService
-        const claim = await this.delivService.claimDelivery(sourceGroup.chatId, messageId, destination.id);
+    // Reject processing if system shutdown was requested
+    if (this.isShuttingDown) {
+      console.warn(`[DistributionService] Rejecting announcement distribution: system shutdown in progress.`);
+      return summary;
+    }
 
-        if (!claim.canDeliver) {
-          if (claim.reason === 'ALREADY_DELIVERED') {
-            console.log(
-              `[DistributionService Idempotency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
-              `Message #${messageId} from chat ${sourceGroup.chatId} was already successfully delivered.`
-            );
-            summary.skippedCount++;
-            summary.results.push({
-              destinationId: destination.id,
-              destinationChatId: destination.chatId,
-              groupName: destination.groupName,
-              success: true,
-              skipped: true,
-              skipReason: 'Already delivered (Idempotency)',
-            });
-            continue;
-          }
+    this.activeOperations++;
+    try {
+      // 2. Dispatch to destinations using controlled bounded concurrency
+      const deliveryResults = await this.runWithConcurrency(
+        activeDestinations,
+        this.concurrency,
+        async (destination): Promise<DestinationDeliveryResult> => {
+          try {
+            // Step A: Idempotency & Concurrency Check via DeliveryService
+            const claim = await this.delivService.claimDelivery(sourceGroup.chatId, messageId, destination.id);
 
-          if (claim.reason === 'ALREADY_PENDING') {
-            console.log(
-              `[DistributionService Concurrency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
-              `Message #${messageId} is currently being processed by another worker.`
+            if (!claim.canDeliver) {
+              if (claim.reason === 'ALREADY_DELIVERED') {
+                console.log(
+                  `[DistributionService Idempotency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+                  `Message #${messageId} from chat ${sourceGroup.chatId} was already successfully delivered.`
+                );
+                return {
+                  destinationId: destination.id,
+                  destinationChatId: destination.chatId,
+                  groupName: destination.groupName,
+                  success: true,
+                  skipped: true,
+                  skipReason: 'Already delivered (Idempotency)',
+                };
+              }
+
+              if (claim.reason === 'ALREADY_PENDING') {
+                console.log(
+                  `[DistributionService Concurrency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+                  `Message #${messageId} is currently being processed by another worker.`
+                );
+                return {
+                  destinationId: destination.id,
+                  destinationChatId: destination.chatId,
+                  groupName: destination.groupName,
+                  success: false,
+                  skipped: true,
+                  skipReason: 'Delivery currently in flight',
+                };
+              }
+            }
+
+            // Step B: Attempt Forwarding
+            const forwardResult = await this.fwdService.forwardMessage(
+              telegram,
+              {
+                sourceChatId: sourceGroup.chatId,
+                sourceMessageId: messageId,
+                destinationChatId: destination.chatId,
+              },
+              actualToken
             );
-            summary.skippedCount++;
-            summary.results.push({
+
+            if (forwardResult.success) {
+              // Step C1: Mark SUCCESS in database
+              await this.delivService.markSuccess(sourceGroup.chatId, messageId, destination.id);
+
+              return {
+                destinationId: destination.id,
+                destinationChatId: destination.chatId,
+                groupName: destination.groupName,
+                success: true,
+                forwardedMessageId: forwardResult.forwardedMessageId,
+                forwardedMessageIds: forwardResult.forwardedMessageIds,
+              };
+            } else {
+              // Step C2: Mark FAILED or RETRYING in database
+              await this.delivService.markFailure(
+                sourceGroup.chatId,
+                messageId,
+                destination.id,
+                forwardResult.errorMessage || 'Unknown forward failure',
+                forwardResult.isTransient,
+                forwardResult.retryAfterSeconds
+              );
+
+              // Handle rate limit backoff if Telegram returns retry_after
+              if (forwardResult.errorType === ForwardErrorType.RATE_LIMITED && forwardResult.retryAfterSeconds) {
+                const backoffMs = Math.min(forwardResult.retryAfterSeconds * 1000, this.maxBackoffMs);
+                console.warn(
+                  `[DistributionService RateLimit] Rate limit encountered on destination ${destination.chatId}. ` +
+                  `Backing off for ${backoffMs}ms before continuing...`
+                );
+                await this.sleep(backoffMs);
+              }
+
+              return {
+                destinationId: destination.id,
+                destinationChatId: destination.chatId,
+                groupName: destination.groupName,
+                success: false,
+                errorType: forwardResult.errorType,
+                errorMessage: forwardResult.errorMessage,
+                retryAfterSeconds: forwardResult.retryAfterSeconds,
+              };
+            }
+          } catch (err) {
+            // Fallback resilience: catch unexpected errors to guarantee loop continuation
+            const sanitized = sanitizeError(err, actualToken);
+            console.error(
+              `[DistributionService Error] Unexpected error forwarding to "${destination.groupName}" (${destination.chatId}): ${sanitized}`
+            );
+
+            // Record failure in database
+            await this.delivService.markFailure(sourceGroup.chatId, messageId, destination.id, sanitized).catch(() => {});
+
+            return {
               destinationId: destination.id,
               destinationChatId: destination.chatId,
               groupName: destination.groupName,
               success: false,
-              skipped: true,
-              skipReason: 'Delivery currently in flight',
-            });
-            continue;
+              errorType: ForwardErrorType.UNKNOWN_ERROR,
+              errorMessage: sanitized,
+            };
+          } finally {
+            if (this.interDestinationDelayMs > 0) {
+              await this.sleep(this.interDestinationDelayMs);
+            }
           }
         }
+      );
 
-        // Step B: Attempt Forwarding
-        const forwardResult = await this.fwdService.forwardMessage(
-          telegram,
-          {
-            sourceChatId: sourceGroup.chatId,
-            sourceMessageId: messageId,
-            destinationChatId: destination.chatId,
-          },
-          actualToken
-        );
-
-        if (forwardResult.success) {
-          // Step C1: Mark SUCCESS in database
-          await this.delivService.markSuccess(sourceGroup.chatId, messageId, destination.id);
-
+      // Collate results and counts in exact destination order
+      for (const res of deliveryResults) {
+        summary.results.push(res);
+        if (res.skipped) {
+          summary.skippedCount++;
+        } else if (res.success) {
           summary.successfulCount++;
-          summary.results.push({
-            destinationId: destination.id,
-            destinationChatId: destination.chatId,
-            groupName: destination.groupName,
-            success: true,
-            forwardedMessageId: forwardResult.forwardedMessageId,
-            forwardedMessageIds: forwardResult.forwardedMessageIds,
-          });
         } else {
-          // Step C2: Mark FAILED or RETRYING in database
-          await this.delivService.markFailure(
-            sourceGroup.chatId,
-            messageId,
-            destination.id,
-            forwardResult.errorMessage || 'Unknown forward failure',
-            forwardResult.isTransient,
-            forwardResult.retryAfterSeconds
-          );
-
           summary.failedCount++;
-          summary.results.push({
-            destinationId: destination.id,
-            destinationChatId: destination.chatId,
-            groupName: destination.groupName,
-            success: false,
-            errorType: forwardResult.errorType,
-            errorMessage: forwardResult.errorMessage,
-            retryAfterSeconds: forwardResult.retryAfterSeconds,
-          });
-
-          // Handle rate limit backoff if Telegram returns retry_after
-          if (forwardResult.errorType === ForwardErrorType.RATE_LIMITED && forwardResult.retryAfterSeconds) {
-            const backoffMs = Math.min(forwardResult.retryAfterSeconds * 1000, this.maxBackoffMs);
-            console.warn(
-              `[DistributionService RateLimit] Rate limit encountered on destination ${destination.chatId}. ` +
-              `Backing off for ${backoffMs}ms before continuing...`
-            );
-            await this.sleep(backoffMs);
-          }
         }
-      } catch (err) {
-        // Fallback resilience: catch unexpected errors to guarantee loop continuation
-        const sanitized = sanitizeError(err, actualToken);
-        console.error(
-          `[DistributionService Error] Unexpected error forwarding to "${destination.groupName}" (${destination.chatId}): ${sanitized}`
-        );
-
-        // Record failure in database
-        await this.delivService.markFailure(sourceGroup.chatId, messageId, destination.id, sanitized).catch(() => {});
-
-        summary.failedCount++;
-        summary.results.push({
-          destinationId: destination.id,
-          destinationChatId: destination.chatId,
-          groupName: destination.groupName,
-          success: false,
-          errorType: ForwardErrorType.UNKNOWN_ERROR,
-          errorMessage: sanitized,
-        });
       }
-
-      // Small polite inter-destination delay to avoid burst violations across many groups
-      if (this.interDestinationDelayMs > 0 && i < activeDestinations.length - 1) {
-        await this.sleep(this.interDestinationDelayMs);
-      }
+    } finally {
+      this.activeOperations--;
     }
 
     console.log(
@@ -377,130 +452,149 @@ export class DistributionService {
     }
 
     console.log(
-      `[DistributionService] Distributing album to ${activeDestinations.length} active destination group(s)...`
+      `[DistributionService] Distributing album to ${activeDestinations.length} active destination group(s) ` +
+      `(Bounded concurrency: ${this.concurrency})...`
     );
 
-    for (let i = 0; i < activeDestinations.length; i++) {
-      const destination = activeDestinations[i];
-      try {
-        // Step A: Idempotency check for the album items
-        const claim = await this.delivService.claimAlbumDelivery(sourceGroup.chatId, sortedIds, destination.id);
+    // Reject processing if system shutdown was requested
+    if (this.isShuttingDown) {
+      console.warn(`[DistributionService] Rejecting album distribution: system shutdown in progress.`);
+      return summary;
+    }
 
-        if (!claim.canDeliver) {
-          if (claim.reason === 'ALREADY_DELIVERED') {
-            console.log(
-              `[DistributionService Idempotency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
-              `Album ${mediaGroupId} was already successfully delivered.`
-            );
-            summary.skippedCount++;
-            summary.results.push({
-              destinationId: destination.id,
-              destinationChatId: destination.chatId,
-              groupName: destination.groupName,
-              success: true,
-              skipped: true,
-              skipReason: 'Album already delivered (Idempotency)',
-            });
-            continue;
-          }
+    this.activeOperations++;
+    try {
+      const deliveryResults = await this.runWithConcurrency(
+        activeDestinations,
+        this.concurrency,
+        async (destination): Promise<DestinationDeliveryResult> => {
+          try {
+            // Step A: Idempotency check for the album items
+            const claim = await this.delivService.claimAlbumDelivery(sourceGroup.chatId, sortedIds, destination.id);
 
-          if (claim.reason === 'ALREADY_PENDING') {
-            console.log(
-              `[DistributionService Concurrency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
-              `Album ${mediaGroupId} is currently being processed by another worker.`
+            if (!claim.canDeliver) {
+              if (claim.reason === 'ALREADY_DELIVERED') {
+                console.log(
+                  `[DistributionService Idempotency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+                  `Album ${mediaGroupId} was already successfully delivered.`
+                );
+                return {
+                  destinationId: destination.id,
+                  destinationChatId: destination.chatId,
+                  groupName: destination.groupName,
+                  success: true,
+                  skipped: true,
+                  skipReason: 'Album already delivered (Idempotency)',
+                };
+              }
+
+              if (claim.reason === 'ALREADY_PENDING') {
+                console.log(
+                  `[DistributionService Concurrency] ⏭️ Skipping destination "${destination.groupName}" (${destination.id}): ` +
+                  `Album ${mediaGroupId} is currently being processed by another worker.`
+                );
+                return {
+                  destinationId: destination.id,
+                  destinationChatId: destination.chatId,
+                  groupName: destination.groupName,
+                  success: false,
+                  skipped: true,
+                  skipReason: 'Album delivery currently in flight',
+                };
+              }
+            }
+
+            // Step B: Forward album atomically
+            const forwardResult = await this.fwdService.forwardMessages(
+              telegram,
+              {
+                sourceChatId: sourceGroup.chatId,
+                sourceMessageIds: sortedIds,
+                destinationChatId: destination.chatId,
+              },
+              token
             );
-            summary.skippedCount++;
-            summary.results.push({
+
+            if (forwardResult.success) {
+              // Step C1: Mark SUCCESS for all items in database
+              await this.delivService.markAlbumSuccess(sourceGroup.chatId, sortedIds, destination.id);
+
+              return {
+                destinationId: destination.id,
+                destinationChatId: destination.chatId,
+                groupName: destination.groupName,
+                success: true,
+                forwardedMessageId: forwardResult.forwardedMessageId,
+                forwardedMessageIds: forwardResult.forwardedMessageIds,
+              };
+            } else {
+              // Step C2: Mark FAILED or RETRYING for all items in database
+              await this.delivService.markAlbumFailure(
+                sourceGroup.chatId,
+                sortedIds,
+                destination.id,
+                forwardResult.errorMessage || 'Unknown forwardMessages failure',
+                forwardResult.isTransient,
+                forwardResult.retryAfterSeconds
+              );
+
+              // Handle rate limit backoff if Telegram returns retry_after
+              if (forwardResult.errorType === ForwardErrorType.RATE_LIMITED && forwardResult.retryAfterSeconds) {
+                const backoffMs = Math.min(forwardResult.retryAfterSeconds * 1000, this.maxBackoffMs);
+                console.warn(
+                  `[DistributionService RateLimit] Rate limit encountered on destination ${destination.chatId}. ` +
+                  `Backing off for ${backoffMs}ms before continuing...`
+                );
+                await this.sleep(backoffMs);
+              }
+
+              return {
+                destinationId: destination.id,
+                destinationChatId: destination.chatId,
+                groupName: destination.groupName,
+                success: false,
+                errorType: forwardResult.errorType,
+                errorMessage: forwardResult.errorMessage,
+                retryAfterSeconds: forwardResult.retryAfterSeconds,
+              };
+            }
+          } catch (err) {
+            const sanitized = sanitizeError(err, token);
+            console.error(
+              `[DistributionService Error] Unexpected error forwarding album to "${destination.groupName}" (${destination.chatId}): ${sanitized}`
+            );
+
+            await this.delivService.markAlbumFailure(sourceGroup.chatId, sortedIds, destination.id, sanitized).catch(() => {});
+
+            return {
               destinationId: destination.id,
               destinationChatId: destination.chatId,
               groupName: destination.groupName,
               success: false,
-              skipped: true,
-              skipReason: 'Album delivery currently in flight',
-            });
-            continue;
+              errorType: ForwardErrorType.UNKNOWN_ERROR,
+              errorMessage: sanitized,
+            };
+          } finally {
+            if (this.interDestinationDelayMs > 0) {
+              await this.sleep(this.interDestinationDelayMs);
+            }
           }
         }
+      );
 
-        // Step B: Forward album atomically
-        const forwardResult = await this.fwdService.forwardMessages(
-          telegram,
-          {
-            sourceChatId: sourceGroup.chatId,
-            sourceMessageIds: sortedIds,
-            destinationChatId: destination.chatId,
-          },
-          token
-        );
-
-        if (forwardResult.success) {
-          // Step C1: Mark SUCCESS for all items in database
-          await this.delivService.markAlbumSuccess(sourceGroup.chatId, sortedIds, destination.id);
-
+      // Collate results in exact destination order
+      for (const res of deliveryResults) {
+        summary.results.push(res);
+        if (res.skipped) {
+          summary.skippedCount++;
+        } else if (res.success) {
           summary.successfulCount++;
-          summary.results.push({
-            destinationId: destination.id,
-            destinationChatId: destination.chatId,
-            groupName: destination.groupName,
-            success: true,
-            forwardedMessageId: forwardResult.forwardedMessageId,
-            forwardedMessageIds: forwardResult.forwardedMessageIds,
-          });
         } else {
-          // Step C2: Mark FAILED or RETRYING for all items in database
-          await this.delivService.markAlbumFailure(
-            sourceGroup.chatId,
-            sortedIds,
-            destination.id,
-            forwardResult.errorMessage || 'Unknown forwardMessages failure',
-            forwardResult.isTransient,
-            forwardResult.retryAfterSeconds
-          );
-
           summary.failedCount++;
-          summary.results.push({
-            destinationId: destination.id,
-            destinationChatId: destination.chatId,
-            groupName: destination.groupName,
-            success: false,
-            errorType: forwardResult.errorType,
-            errorMessage: forwardResult.errorMessage,
-            retryAfterSeconds: forwardResult.retryAfterSeconds,
-          });
-
-          // Handle rate limit backoff if Telegram returns retry_after
-          if (forwardResult.errorType === ForwardErrorType.RATE_LIMITED && forwardResult.retryAfterSeconds) {
-            const backoffMs = Math.min(forwardResult.retryAfterSeconds * 1000, this.maxBackoffMs);
-            console.warn(
-              `[DistributionService RateLimit] Rate limit encountered on destination ${destination.chatId}. ` +
-              `Backing off for ${backoffMs}ms before continuing...`
-            );
-            await this.sleep(backoffMs);
-          }
         }
-      } catch (err) {
-        const sanitized = sanitizeError(err, token);
-        console.error(
-          `[DistributionService Error] Unexpected error forwarding album to "${destination.groupName}" (${destination.chatId}): ${sanitized}`
-        );
-
-        await this.delivService.markAlbumFailure(sourceGroup.chatId, sortedIds, destination.id, sanitized).catch(() => {});
-
-        summary.failedCount++;
-        summary.results.push({
-          destinationId: destination.id,
-          destinationChatId: destination.chatId,
-          groupName: destination.groupName,
-          success: false,
-          errorType: ForwardErrorType.UNKNOWN_ERROR,
-          errorMessage: sanitized,
-        });
       }
-
-      // Small polite inter-destination delay
-      if (this.interDestinationDelayMs > 0 && i < activeDestinations.length - 1) {
-        await this.sleep(this.interDestinationDelayMs);
-      }
+    } finally {
+      this.activeOperations--;
     }
 
     console.log(
@@ -526,6 +620,11 @@ export class DistributionService {
   ): Promise<DistributionSummary | null> {
     const eligibility = this.isEligibleMessage(ctx);
     if (!eligibility.eligible) {
+      return null;
+    }
+
+    if (this.isShuttingDown) {
+      console.warn(`[DistributionService] Rejecting incoming update: system shutdown in progress.`);
       return null;
     }
 

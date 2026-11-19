@@ -200,19 +200,14 @@ export class DestinationService {
     }
 
     try {
-      // Check if source itself is active
-      const source = await prisma.sourceGroup.findUnique({
-        where: { id: trimmedId },
-      });
-
-      if (!source || !source.isActive) {
-        return [];
-      }
-
+      // Single optimized query with relation filter: eliminates N+1 and extra database roundtrip
       return await prisma.destinationGroup.findMany({
         where: {
           sourceGroupId: trimmedId,
           isActive: true,
+          sourceGroup: {
+            isActive: true,
+          },
         },
         orderBy: {
           createdAt: 'asc',
